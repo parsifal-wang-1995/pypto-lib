@@ -119,7 +119,7 @@ QH_MM_TILE = 64
 SCORE_C_TILE = 64
 SCORE_INIT_COLS = 1024
 EXPAND_W_TILE = 256
-EXPAND_TAIL_CHUNK = 8   # covers the last lanes in one aligned tile
+EXPAND_TAIL_CHUNK = 8  # covers the last lanes in one aligned tile
 # pl.const accepts literals only; assert keeps the hard-coded start honest.
 assert TOPK_INDEX_WIDTH - EXPAND_TAIL_CHUNK == 2043
 # pl.full takes float constants even for integer tensors; precompute because
@@ -198,9 +198,7 @@ def indexer_proj(
                 w_q_b[k0 : k0 + PROJ_K_TILE, o0 : o0 + Q_OUT_TILE],
                 init_cond=(k0 == 0),
             )
-        q_flat[t0 : t0 + PROJ_T_TILE, o0 : o0 + Q_OUT_TILE] = pl.cast(
-            q_acc, pl.BF16, mode="rint"
-        )
+        q_flat[t0 : t0 + PROJ_T_TILE, o0 : o0 + Q_OUT_TILE] = pl.cast(q_acc, pl.BF16, mode="rint")
 
     for idx in pl.spmd(t_dim // PROJ_T_TILE, name_hint="indexer_k_proj"):
         t0 = idx * PROJ_T_TILE
@@ -221,9 +219,7 @@ def indexer_proj(
         weight_row = pl.cast(
             pl.reshape(k_norm_weight, [1, INDEX_DIM])[0:1, 0:INDEX_DIM], pl.FP32, mode="none"
         )
-        bias_row = pl.cast(
-            pl.reshape(k_norm_bias, [1, INDEX_DIM])[0:1, 0:INDEX_DIM], pl.FP32, mode="none"
-        )
+        bias_row = pl.cast(pl.reshape(k_norm_bias, [1, INDEX_DIM])[0:1, 0:INDEX_DIM], pl.FP32, mode="none")
         index_k[t0 : t0 + PROJ_T_TILE, 0:INDEX_DIM] = pl.cast(
             pl.col_expand_add(pl.col_expand_mul(normed, weight_row), bias_row),
             pl.BF16,
@@ -333,17 +329,13 @@ def indexer_score(
 
     q_i8 = pl.create_tensor([t_dim * INDEX_H, INDEX_DIM], dtype=pl.INT8)
     q_scale_dq = pl.create_tensor([t_dim * INDEX_H, 1], dtype=pl.FP32)
-    for idx in pl.spmd(
-        t_dim * INDEX_H // QH_MM_TILE, name_hint="indexer_q_quant", allow_early_resolve=True
-    ):
+    for idx in pl.spmd(t_dim * INDEX_H // QH_MM_TILE, name_hint="indexer_q_quant", allow_early_resolve=True):
         r0 = idx * QH_MM_TILE
         qh_tile = qh_acc[r0 : r0 + QH_MM_TILE, :]
         qh_amax = pl.full([1, QH_MM_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         qh_abs = pl.maximum(qh_tile, pl.neg(qh_tile))
         qh_amax = pl.maximum(qh_amax, pl.reshape(pl.row_max(qh_abs), [1, QH_MM_TILE]))
-        scale_quant_row = pl.div(
-            pl.full([1, QH_MM_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qh_amax
-        )
+        scale_quant_row = pl.div(pl.full([1, QH_MM_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qh_amax)
         q_scale_dq[r0 : r0 + QH_MM_TILE, :] = pl.reshape(pl.recip(scale_quant_row), [QH_MM_TILE, 1])
         qh_scaled = pl.row_expand_mul(qh_tile, pl.reshape(scale_quant_row, [QH_MM_TILE, 1]))
         qh_i32 = pl.cast(qh_scaled, target_type=pl.INT32, mode="rint")
@@ -368,12 +360,8 @@ def indexer_score(
         kv_amax = pl.full([1, SCORE_C_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         kv_abs = pl.maximum(kv_tile, pl.neg(kv_tile))
         kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_abs), [1, SCORE_C_TILE]))
-        scale_quant_row = pl.div(
-            pl.full([1, SCORE_C_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax
-        )
-        pool_scale[c0 : c0 + SCORE_C_TILE, :] = pl.reshape(
-            pl.recip(scale_quant_row), [SCORE_C_TILE, 1]
-        )
+        scale_quant_row = pl.div(pl.full([1, SCORE_C_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
+        pool_scale[c0 : c0 + SCORE_C_TILE, :] = pl.reshape(pl.recip(scale_quant_row), [SCORE_C_TILE, 1])
         kv_scaled = pl.row_expand_mul(kv_tile, pl.reshape(scale_quant_row, [SCORE_C_TILE, 1]))
         kv_i32 = pl.cast(kv_scaled, target_type=pl.INT32, mode="rint")
         kv_half = pl.cast(kv_i32, target_type=pl.FP16, mode="round")
@@ -390,9 +378,7 @@ def indexer_score(
         if visible > 0:
             seg0 = pl.read(seg_start, [token])
             q_tile_i8 = q_i8[token * INDEX_H : token * INDEX_H + INDEX_H, :]
-            q_scale_row = pl.reshape(
-                q_scale_dq[token * INDEX_H : token * INDEX_H + INDEX_H, :], [1, INDEX_H]
-            )
+            q_scale_row = pl.reshape(q_scale_dq[token * INDEX_H : token * INDEX_H + INDEX_H, :], [1, INDEX_H])
             weight_row = head_weights[token : token + 1, 0:INDEX_H]
             for c0 in pl.range(0, visible, SCORE_C_TILE):
                 kv_q_i8 = pool_i8[seg0 + c0 : seg0 + c0 + SCORE_C_TILE, :]
@@ -406,12 +392,8 @@ def indexer_score(
                 weighted = pl.col_expand_mul(relu, weight_row)
                 row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_C_TILE])
                 valid_len = pl.min(SCORE_C_TILE, visible - c0)
-                masked = pl.fillpad(
-                    pl.set_validshape(row_score, 1, valid_len), pad_value=pl.PadValue.min
-                )
-                masked = pl.maximum(
-                    masked, pl.full([1, SCORE_C_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
-                )
+                masked = pl.fillpad(pl.set_validshape(row_score, 1, valid_len), pad_value=pl.PadValue.min)
+                masked = pl.maximum(masked, pl.full([1, SCORE_C_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
                 index_scores[token : token + 1, seg0 + c0 : seg0 + c0 + SCORE_C_TILE] = masked
 
 
@@ -452,12 +434,8 @@ def _indexer_topk_query(
 ) -> None:
     """Select one query's top visible pools, one sort leaf at a time."""
     query = pl.tile.get_block_idx()
-    pl.store(
-        pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=-1), [query, 0], selected_pools
-    )
-    pl.store(
-        pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=0), [query, 0], selected_valid
-    )
+    pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=-1), [query, 0], selected_pools)
+    pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=0), [query, 0], selected_valid)
     visible_count = pl.max(pl.read(pool_count, [query]), 0)
     if visible_count > 0:
         seg0 = pl.read(seg_start, [query])
@@ -467,9 +445,7 @@ def _indexer_topk_query(
         for leaf in pl.range(leaf_count):
             leaf0 = leaf * LEAF
             leaf_valid = pl.min(LEAF, visible_count - leaf0)
-            row_raw = pl.load(
-                index_scores, [query, seg0 + leaf0], [1, LEAF], valid_shape=[1, leaf_valid]
-            )
+            row_raw = pl.load(index_scores, [query, seg0 + leaf0], [1, LEAF], valid_shape=[1, leaf_valid])
             row = pl.tile.fillpad(row_raw, pad_value=pl.PadValue.min)
             row = pl.maximum(row, pl.tile.full([1, LEAF], dtype=pl.FP32, value=FP32_NEG_INF))
             index_ramp = pl.tile.arange(0, [1, LEAF], dtype=pl.INT32)
@@ -487,9 +463,7 @@ def _indexer_topk_query(
                 merged = pl.tile.mrgsort(pairs, leaf_pairs, tmp=merge_tmp)
                 pl.store(pl.tile.slice(merged, [1, PAIR_WIDTH], [0, 0]), [query, 0], running_pairs)
         pairs = pl.load(running_pairs, [query, 0], [1, PAIR_WIDTH])
-        picked = pl.tile.gather_mask(
-            pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-        )
+        picked = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
         valid_topk = pl.min(visible_count, KPOOL_SELECT_K)
         indices_out = pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=-1)
         validity_out = pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=0)
@@ -546,9 +520,9 @@ def golden_indexer_expand(
         tail = int(tail_count[token])
         hist_pos = selected_pools[token].to(torch.int64)[pool_id] * INDEX_KPOOL + rem
         tail_offset = lanes - hist_len
-        hist_active = (
-            (lanes < hist_len) & (selected_valid[token].to(torch.int64)[pool_id] > 0)
-        ).to(torch.int64)
+        hist_active = ((lanes < hist_len) & (selected_valid[token].to(torch.int64)[pool_id] > 0)).to(
+            torch.int64
+        )
         tail_active = ((tail_offset >= 0) & (tail_offset < tail)).to(torch.int64)
         positions = hist_active * (hist_pos + 1) + tail_active * (base + tail_offset + 1) - 1
         expanded[token] = positions.to(torch.int32)
@@ -586,9 +560,7 @@ def indexer_expand(
         token = pl.tile.get_block_idx()
         # Scalar bookkeeping stays INT32: pl.read preserves the tensor dtype but
         # pl.min promotes to index, which scalar instructions reject.
-        groups = pl.cast(
-            pl.min(pl.read(kv_len, [token]) // INDEX_KPOOL, KPOOL_SELECT_K), pl.INT32
-        )
+        groups = pl.cast(pl.min(pl.read(kv_len, [token]) // INDEX_KPOOL, KPOOL_SELECT_K), pl.INT32)
         hist_len = pl.cast(groups * INDEX_KPOOL, pl.INT32)
         base = pl.cast(pl.read(tail_start, [token]), pl.INT32)
         tail = pl.cast(pl.read(tail_count, [token]), pl.INT32)
@@ -600,9 +572,7 @@ def indexer_expand(
                 mode="trunc",
             )
             pool_id = pl.minimum(pool_raw, KPOOL_SELECT_K - 1)
-            sel_row = pl.gather(
-                selected_pools[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_id
-            )
+            sel_row = pl.gather(selected_pools[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_id)
             sel_validity = pl.gather(
                 selected_valid[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_id
             )
@@ -640,12 +610,8 @@ def indexer_expand(
             mode="trunc",
         )
         pool_t = pl.minimum(pool_t, KPOOL_SELECT_K - 1)
-        sel_t = pl.gather(
-            selected_pools[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_t
-        )
-        valid_t = pl.gather(
-            selected_valid[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_t
-        )
+        sel_t = pl.gather(selected_pools[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_t)
+        valid_t = pl.gather(selected_valid[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_t)
         hslack_t = pl.neg(pl.sub(lane_t, hist_len))
         hmask_t = pl.minimum(pl.maximum(hslack_t, 0), 1)
         hactive_t = pl.mul(hmask_t, pl.minimum(valid_t, 1))
@@ -668,9 +634,7 @@ def indexer_expand(
         topk_indices[
             token : token + 1,
             TOPK_INDEX_WIDTH - EXPAND_TAIL_CHUNK : TOPK_INDEX_WIDTH,
-        ] = pl.cast(
-            pos_tf, pl.INT32, mode="none"
-        )
+        ] = pl.cast(pos_tf, pl.INT32, mode="none")
     return expand_tid
 
 
@@ -789,9 +753,7 @@ def sylvester_hadamard(head_dim: int = INDEX_DIM) -> torch.Tensor:
     """The scaled Sylvester Hadamard the load-time converter builds."""
     matrix = torch.ones((1, 1))
     while matrix.shape[0] < head_dim:
-        matrix = torch.cat(
-            [torch.cat([matrix, matrix], dim=1), torch.cat([matrix, -matrix], dim=1)], dim=0
-        )
+        matrix = torch.cat([torch.cat([matrix, matrix], dim=1), torch.cat([matrix, -matrix], dim=1)], dim=0)
     return (matrix * (head_dim**-0.5)).to(torch.bfloat16)
 
 
@@ -834,9 +796,7 @@ def build_indexer_proj_specs(tokens: int = 48):
         TensorSpec("k_norm_weight", [INDEX_DIM], torch.bfloat16, init_value=init_k_norm_weight),
         TensorSpec("k_norm_bias", [INDEX_DIM], torch.bfloat16, init_value=init_k_norm_bias),
         TensorSpec("w_weights", [D, INDEX_H], torch.bfloat16, init_value=init_w_weights),
-        TensorSpec(
-            "w_compress_gate", [D, INDEX_DIM], torch.bfloat16, init_value=init_w_compress_gate
-        ),
+        TensorSpec("w_compress_gate", [D, INDEX_DIM], torch.bfloat16, init_value=init_w_compress_gate),
         TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16),
         TensorSpec("index_k", [tokens, INDEX_DIM], torch.bfloat16),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32),
@@ -882,9 +842,7 @@ def build_indexer_score_specs(tokens: int = 8):
 
     counts = (3000, 140)
     positions = (2, 6, 5000, 11999, 3, 7, 500, 559)
-    width, pool_table_rows, seg_start, pool_count, pool_rows = _pool_batch(
-        tokens, counts, positions
-    )
+    width, pool_table_rows, seg_start, pool_count, pool_rows = _pool_batch(tokens, counts, positions)
 
     generator = torch.Generator().manual_seed(73)
 
@@ -898,15 +856,9 @@ def build_indexer_score_specs(tokens: int = 8):
         return torch.randn(tokens, INDEX_H, generator=generator)
 
     return [
-        TensorSpec(
-            "index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16, init_value=init_index_q
-        ),
-        TensorSpec(
-            "hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard
-        ),
-        TensorSpec(
-            "pool_cache", [pool_table_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache
-        ),
+        TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16, init_value=init_index_q),
+        TensorSpec("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard),
+        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache),
         TensorSpec("pool_rows", [width], torch.int32, init_value=lambda: pool_rows),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32, init_value=init_head_weights),
         TensorSpec("seg_start", [tokens], torch.int32, init_value=lambda: seg_start),
@@ -974,9 +926,7 @@ def build_indexer_expand_specs(tokens: int = 8):
         return valid
 
     def init_tail_start():
-        return torch.tensor(
-            [length - length % INDEX_KPOOL for length in lengths], dtype=torch.int32
-        )
+        return torch.tensor([length - length % INDEX_KPOOL for length in lengths], dtype=torch.int32)
 
     def init_tail_count():
         return torch.tensor([length % INDEX_KPOOL for length in lengths], dtype=torch.int32)
@@ -1129,9 +1079,7 @@ def main():
     parser.add_argument("--tokens", type=int, default=48)
     args = parser.parse_args()
 
-    def selected_pools_compare(
-        actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol
-    ):
+    def selected_pools_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         scores = inputs["index_scores"].float()
         seg0 = inputs["seg_start"].long().unsqueeze(1)
         invalid = actual < 0
@@ -1182,9 +1130,7 @@ def main():
                 rtol=1.0 / 128,
                 atol=1e-4,
                 compare_fn={
-                    "index_scores": ratio_allclose(
-                        atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01
-                    ),
+                    "index_scores": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
                 },
                 compile_only=args.compile_only,
             )

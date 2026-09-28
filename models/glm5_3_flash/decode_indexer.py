@@ -48,7 +48,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import BLOCK_SIZE, D, INDEX_DIM, INDEX_H
-from models.glm5_3_flash.config import INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE
+from models.glm5_3_flash.config import INDEX_KPOOL
 from models.glm5_3_flash.config import INDEX_STATE_WIDTH, KPOOL_SELECT_K, POOLS_DYN
 from models.glm5_3_flash.config import Q_LORA, TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN
 from models.glm5_3_flash.indexer_cache import POOL_VALID_WIDTH
@@ -83,9 +83,7 @@ def decode_indexer_step_test(
     tail_count: pl.Tensor[[T_DYN], pl.INT32],
     kv_len: pl.Tensor[[T_DYN], pl.INT32],
     raw_cache: pl.InOut[pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32]],
-    pool_cache: pl.InOut[
-        pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.BF16]
-    ],
+    pool_cache: pl.InOut[pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.BF16]],
     pool_valid: pl.Out[pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32]],
     index_q: pl.Out[pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16]],
     index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16]],
@@ -139,9 +137,7 @@ def decode_indexer_step_test(
         gate_scores,
     )
     indexer_cache_write(index_k, gate_scores, index_slots, raw_cache)
-    indexer_pool_write(
-        raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid
-    )
+    indexer_pool_write(raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid)
     indexer_score(
         index_q,
         hadamard,
@@ -153,9 +149,7 @@ def decode_indexer_step_test(
         index_scores,
     )
     indexer_topk(index_scores, seg_start, pool_count, selected_pools, selected_valid)
-    indexer_expand(
-        selected_pools, selected_valid, tail_start, tail_count, kv_len, topk_indices
-    )
+    indexer_expand(selected_pools, selected_valid, tail_start, tail_count, kv_len, topk_indices)
     return (
         index_q,
         index_k,
@@ -256,17 +250,13 @@ def build_decode_indexer_step_specs(requests: int = 4):
     for request in range(requests):
         closing = new_counts[request] - 1
         first = closing * INDEX_KPOOL
-        closing_slots[request] = torch.tensor(
-            raw_rows_for(request, first, INDEX_KPOOL), dtype=torch.int32
-        )
+        closing_slots[request] = torch.tensor(raw_rows_for(request, first, INDEX_KPOOL), dtype=torch.int32)
         closing_dest[request] = pool_row_of[(request, closing)]
 
     index_slots = torch.zeros(tokens, dtype=torch.int32)
     for request in range(requests):
         for row in range(rows_per_request):
-            index_slots[request * rows_per_request + row] = mapping[
-                (request, prior_tokens[request] + row)
-            ]
+            index_slots[request * rows_per_request + row] = mapping[(request, prior_tokens[request] + row)]
 
     def init_x():
         return torch.randn(tokens, D, generator=generator, dtype=torch.float32).bfloat16()
@@ -319,18 +309,14 @@ def build_decode_indexer_step_specs(requests: int = 4):
             torch.bfloat16,
             init_value=lambda: (0.1 * torch.randn(INDEX_DIM, generator=generator)).bfloat16(),
         ),
-        TensorSpec(
-            "w_weights", [D, INDEX_H], torch.bfloat16, init_value=init_weights("w_weights", 0.05)
-        ),
+        TensorSpec("w_weights", [D, INDEX_H], torch.bfloat16, init_value=init_weights("w_weights", 0.05)),
         TensorSpec(
             "w_compress_gate",
             [D, INDEX_DIM],
             torch.bfloat16,
             init_value=init_weights("w_compress_gate", 0.02),
         ),
-        TensorSpec(
-            "hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard
-        ),
+        TensorSpec("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard),
         TensorSpec(
             "compress_ape",
             [INDEX_KPOOL, INDEX_DIM],
@@ -354,9 +340,7 @@ def build_decode_indexer_step_specs(requests: int = 4):
             torch.float32,
             init_value=init_raw_cache,
         ),
-        TensorSpec(
-            "pool_cache", [pool_table_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache
-        ),
+        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache),
         TensorSpec("pool_valid", [requests, POOL_VALID_WIDTH], torch.int32),
         TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16),
         TensorSpec("index_k", [tokens, INDEX_DIM], torch.bfloat16),
@@ -440,9 +424,7 @@ def main():
     parser.add_argument("--requests", type=int, default=4)
     args = parser.parse_args()
 
-    def selected_pools_compare(
-        actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol
-    ):
+    def selected_pools_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         scores = actual_outputs["index_scores"].float()
         seg0 = inputs["seg_start"].long().unsqueeze(1)
         invalid = actual < 0

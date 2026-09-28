@@ -263,18 +263,14 @@ def indexer_pool_write_test(
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     pool_token_slots: pl.Tensor[[POOLS_DYN, INDEX_KPOOL], pl.INT32],
     pool_slots: pl.Tensor[[POOLS_DYN], pl.INT32],
-    pool_cache: pl.InOut[
-        pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16]
-    ],
+    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16]],
     pool_valid: pl.Out[pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32]],
 ):
     """Close every pool event of one dispatch for golden.run validation."""
     pool_token_slots.bind_dynamic(0, POOLS_DYN)
     pool_slots.bind_dynamic(0, POOLS_DYN)
     pool_valid.bind_dynamic(0, POOLS_DYN)
-    indexer_pool_write(
-        raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid
-    )
+    indexer_pool_write(raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid)
     return pool_cache, pool_valid
 
 
@@ -356,12 +352,8 @@ def build_indexer_pool_write_specs(events: int = 6, raw_pages: int = 2, pool_pag
         return torch.randn(pool_rows, INDEX_DIM, generator=generator, dtype=torch.float32).bfloat16()
 
     return [
-        TensorSpec(
-            "raw_cache", [raw_rows, INDEX_STATE_WIDTH], torch.float32, init_value=init_raw_cache
-        ),
-        TensorSpec(
-            "compress_ape", [INDEX_KPOOL, INDEX_DIM], torch.bfloat16, init_value=init_compress_ape
-        ),
+        TensorSpec("raw_cache", [raw_rows, INDEX_STATE_WIDTH], torch.float32, init_value=init_raw_cache),
+        TensorSpec("compress_ape", [INDEX_KPOOL, INDEX_DIM], torch.bfloat16, init_value=init_compress_ape),
         TensorSpec(
             "pool_token_slots",
             [events, INDEX_KPOOL],
@@ -425,9 +417,7 @@ def _self_check() -> None:
         dtype=torch.int32,
     )
     pool_slots = torch.tensor([7, 3, 0, 5, 2], dtype=torch.int32)
-    new_cache, valid = golden_indexer_pool_write(
-        pool_cache, raw_cache, ape, pool_token_slots, pool_slots
-    )
+    new_cache, valid = golden_indexer_pool_write(pool_cache, raw_cache, ape, pool_token_slots, pool_slots)
     assert valid[:, 0].tolist() == [1, 1, 1, 0, 1], valid
     members = pool_token_slots[0].long()
     weights = torch.softmax(raw_cache[members, INDEX_DIM:].float() + ape.float(), dim=0)
