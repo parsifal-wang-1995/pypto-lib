@@ -123,6 +123,10 @@ SCORE_C_TILE = 64
 # whole group. The token count must be a multiple of SCORE_TOKEN_TILE.
 SCORE_TOKEN_TILE = 4
 SCORE_KV_TILE = 128
+# The pooled table is addressed in POOL_GATHER_BLOCK-row blocks: the host maps each
+# compacted block to one contiguous physical base row, so the gather moves whole
+# blocks instead of single scattered rows.
+POOL_GATHER_BLOCK = 64
 SCORE_INIT_COLS = 1024
 EXPAND_W_TILE = 256
 EXPAND_TAIL_CHUNK = 8  # covers the last lanes in one aligned tile
@@ -264,7 +268,7 @@ def golden_indexer_score(
     hadamard: torch.Tensor,
     pool_cache: torch.Tensor,
     pool_scale: torch.Tensor,
-    pool_rows: torch.Tensor,
+    pool_blocks: torch.Tensor,
     head_weights: torch.Tensor,
     seg_start: torch.Tensor,
     pool_count: torch.Tensor,
@@ -273,19 +277,22 @@ def golden_indexer_score(
 
     The pooled table arrives already quantized — INT8 keys with their per-row
     dequant scales, written at pool close — and the Hadamard rotation and the
-    query INT8 quantization mirror the kernel op for op. The reference
-    ``Glm5NextTextIndexer`` scores in plain FP32, and the quantized path is the
-    a2a3 deployment numerics, so the golden carries the quantization rather than
-    approximating around it.
+    query INT8 quantization mirror the kernel op for op. ``pool_blocks`` maps
+    each compacted POOL_GATHER_BLOCK-row block to its contiguous physical base.
+    The reference ``Glm5NextTextIndexer`` scores in plain FP32, and the
+    quantized path is the a2a3 deployment numerics, so the golden carries the
+    quantization rather than approximating around it.
     """
     tokens = index_q.shape[0]
-    pools = pool_rows.shape[0]
+    pools = pool_blocks.shape[0] * POOL_GATHER_BLOCK
     scores = torch.full((tokens, pools), FP32_NEG_INF, dtype=torch.float32)
     if pools == 0 or tokens == 0:
         return scores
     rotated = index_q.float().reshape(tokens * INDEX_H, INDEX_DIM) @ hadamard.float()
     q_i8, q_scale = quantize_per_token_int8(rotated)
-    gathered = pool_rows.to(torch.long)
+    gathered = pool_blocks.to(torch.long).repeat_interleave(POOL_GATHER_BLOCK) + torch.arange(
+        POOL_GATHER_BLOCK
+    ).repeat(pool_blocks.shape[0])
     k_i8 = pool_cache[gathered]
     k_scale = pool_scale[gathered, 0:1]
     for token in range(tokens):
@@ -310,7 +317,7 @@ def _indexer_score_prepare(
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
     pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
-    pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
+    pool_blocks: pl.Tensor[[POOLS_DYN], pl.INT32],
     index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
 ):
     """Shared scorer prologue: query rotation/quant, pool gather and init.
@@ -320,7 +327,7 @@ def _indexer_score_prepare(
     at the finite negative sentinel.
     """
     t_dim = pl.tensor.dim(index_q, 0)
-    pools = pl.tensor.dim(pool_rows, 0)
+    pools = pl.tensor.dim(pool_blocks, 0) * POOL_GATHER_BLOCK
     q_flat = pl.reshape(index_q, [t_dim * INDEX_H, INDEX_DIM])
 
     qh_acc = pl.create_tensor([t_dim * INDEX_H, INDEX_DIM], dtype=pl.FP32)
@@ -354,14 +361,11 @@ def _indexer_score_prepare(
     # hits an unsupported layout, and the donor reads its C8 cache the same way.
     pool_i8 = pl.create_tensor([pools + SCORE_C_TILE, INDEX_DIM], dtype=pl.INT8)
     pool_scale_g = pl.create_tensor([pools + SCORE_C_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32)
-    for c_block in pl.spmd(pools // SCORE_C_TILE, name_hint="indexer_pool_gather"):
-        c0 = pl.cast(c_block, pl.INT32) * SCORE_C_TILE
-        for r in pl.range(SCORE_C_TILE):
-            ri = pl.cast(r, pl.INT32)
-            row = pl.cast(c0 + ri, pl.INDEX)
-            member = pl.cast(pl.read(pool_rows, [c0 + ri]), pl.INDEX)
-            pool_i8[row : row + 1, :] = pool_cache[member : member + 1, :]
-            pool_scale_g[row : row + 1, :] = pool_scale[member : member + 1, :]
+    for c_block in pl.spmd(pools // POOL_GATHER_BLOCK, name_hint="indexer_pool_gather"):
+        c0_idx = pl.cast(c_block, pl.INDEX) * POOL_GATHER_BLOCK
+        base = pl.cast(pl.read(pool_blocks, [c_block]), pl.INDEX)
+        pool_i8[c0_idx : c0_idx + POOL_GATHER_BLOCK, :] = pool_cache[base : base + POOL_GATHER_BLOCK, :]
+        pool_scale_g[c0_idx : c0_idx + POOL_GATHER_BLOCK, :] = pool_scale[base : base + POOL_GATHER_BLOCK, :]
     # Collapse the replicated scale lanes once, width-proportional work outside
     # the per-token loop: a strided lane-0 column read is not a legal TLOAD, and
     # reducing inside the score loop costs ~40-70 ns per (token, tile) step.
@@ -387,7 +391,7 @@ def indexer_score(
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
     pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
-    pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
+    pool_blocks: pl.Tensor[[POOLS_DYN], pl.INT32],
     head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
     seg_start: pl.Tensor[[T_DYN], pl.INT32],
     pool_count: pl.Tensor[[T_DYN], pl.INT32],
@@ -395,8 +399,8 @@ def indexer_score(
 ):
     """Score every query row against its request's pooled keys, prefill shape.
 
-    ``pool_rows`` maps each compacted pool id to its physical row in the paged
-    pooled table — the host lowers paging, the kernel gathers. The table rows
+    ``pool_blocks`` maps each compacted POOL_GATHER_BLOCK-row block to its
+    contiguous physical base row — the host lowers paging, the kernel gathers. The table rows
     are INT8 with per-row dequant scales, quantized once at pool close, so the
     scorer only gathers them into contiguous scratch and never re-quantizes
     (donor C8 shape). The score matrix width must be a multiple of
@@ -408,7 +412,7 @@ def indexer_score(
     """
     t_dim = pl.tensor.dim(index_q, 0)
     q_i8, q_scale_dq, pool_i8, pool_scale_col = _indexer_score_prepare(
-        index_q, hadamard, pool_cache, pool_scale, pool_rows, index_scores
+        index_q, hadamard, pool_cache, pool_scale, pool_blocks, index_scores
     )
 
     # Donor CP shape: one block owns SCORE_TOKEN_TILE consecutive queries and
@@ -533,7 +537,7 @@ def indexer_score_token(
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
     pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
-    pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
+    pool_blocks: pl.Tensor[[POOLS_DYN], pl.INT32],
     head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
     seg_start: pl.Tensor[[T_DYN], pl.INT32],
     pool_count: pl.Tensor[[T_DYN], pl.INT32],
@@ -549,7 +553,7 @@ def indexer_score_token(
     """
     t_dim = pl.tensor.dim(index_q, 0)
     q_i8, q_scale_dq, pool_i8, pool_scale_col = _indexer_score_prepare(
-        index_q, hadamard, pool_cache, pool_scale, pool_rows, index_scores
+        index_q, hadamard, pool_cache, pool_scale, pool_blocks, index_scores
     )
 
     for token in pl.spmd(t_dim, name_hint="indexer_score"):
@@ -862,7 +866,7 @@ def indexer_score_test(
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
     pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
-    pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
+    pool_blocks: pl.Tensor[[POOLS_DYN], pl.INT32],
     head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
     seg_start: pl.Tensor[[T_DYN], pl.INT32],
     pool_count: pl.Tensor[[T_DYN], pl.INT32],
@@ -873,7 +877,7 @@ def indexer_score_test(
     head_weights.bind_dynamic(0, T_DYN)
     seg_start.bind_dynamic(0, T_DYN)
     pool_count.bind_dynamic(0, T_DYN)
-    pool_rows.bind_dynamic(0, POOLS_DYN)
+    pool_blocks.bind_dynamic(0, POOLS_DYN)
     index_scores.bind_dynamic(0, T_DYN)
     index_scores.bind_dynamic(1, POOLS_DYN)
     pool_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
@@ -882,7 +886,7 @@ def indexer_score_test(
         hadamard,
         pool_cache,
         pool_scale,
-        pool_rows,
+        pool_blocks,
         head_weights,
         seg_start,
         pool_count,
@@ -1005,11 +1009,14 @@ def _pool_batch(tokens: int, counts: tuple[int, ...], positions: tuple[int, ...]
             token = index * per_request + row
             seg_start[token] = sum(counts[:index])
             pool_count[token] = min((positions[token] + 1) // INDEX_KPOOL, count)
-    pool_table_rows = ((pools_true + INDEX_STATE_BLOCK_SIZE - 1) // INDEX_STATE_BLOCK_SIZE) * 4
+    # The pooled table is block-paged: each compacted POOL_GATHER_BLOCK-row block
+    # lands contiguously at one physical base, so the scorer's gather moves
+    # whole blocks. Table rows are therefore block-aligned.
+    blocks = width // POOL_GATHER_BLOCK
+    pool_table_rows = blocks * POOL_GATHER_BLOCK
     generator = torch.Generator().manual_seed(71)
-    pool_rows = torch.zeros(width, dtype=torch.int32)
-    pool_rows[:pools_true] = torch.randperm(pool_table_rows, generator=generator)[:pools_true]
-    return width, pool_table_rows, seg_start, pool_count, pool_rows
+    pool_blocks = torch.randperm(blocks, generator=generator).to(torch.int32) * POOL_GATHER_BLOCK
+    return width, pool_table_rows, seg_start, pool_count, pool_blocks
 
 
 def build_indexer_score_specs(
@@ -1030,7 +1037,7 @@ def build_indexer_score_specs(
 
     counts = (3000, 140) if counts is None else counts
     positions = (2, 6, 5000, 11999, 3, 7, 500, 559) if positions is None else positions
-    width, pool_table_rows, seg_start, pool_count, pool_rows = _pool_batch(tokens, counts, positions)
+    width, pool_table_rows, seg_start, pool_count, pool_blocks = _pool_batch(tokens, counts, positions)
 
     generator = torch.Generator().manual_seed(73)
 
@@ -1061,7 +1068,7 @@ def build_indexer_score_specs(
         TensorSpec(
             "pool_scale", [pool_table_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale
         ),
-        TensorSpec("pool_rows", [width], torch.int32, init_value=lambda: pool_rows),
+        TensorSpec("pool_blocks", [width // POOL_GATHER_BLOCK], torch.int32, init_value=lambda: pool_blocks),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32, init_value=init_head_weights),
         TensorSpec("seg_start", [tokens], torch.int32, init_value=lambda: seg_start),
         TensorSpec("pool_count", [tokens], torch.int32, init_value=lambda: pool_count),
@@ -1189,7 +1196,7 @@ def golden_indexer_score_case(tensors):
         tensors["hadamard"],
         tensors["pool_cache"],
         tensors["pool_scale"],
-        tensors["pool_rows"],
+        tensors["pool_blocks"],
         tensors["head_weights"],
         tensors["seg_start"],
         tensors["pool_count"],
@@ -1463,6 +1470,7 @@ def main():
 
 __all__ = [
     "LEAF",
+    "POOL_GATHER_BLOCK",
     "PAIR_WIDTH",
     "build_indexer_expand_specs",
     "build_indexer_proj_specs",

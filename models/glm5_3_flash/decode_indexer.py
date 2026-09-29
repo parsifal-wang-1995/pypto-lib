@@ -58,6 +58,7 @@ from models.glm5_3_flash.prefill_indexer import LEAF
 from models.glm5_3_flash.prefill_indexer import golden_indexer_expand, golden_indexer_proj
 from models.glm5_3_flash.prefill_indexer import golden_indexer_score, golden_indexer_topk
 from models.glm5_3_flash.prefill_indexer import indexer_expand, indexer_proj
+from models.glm5_3_flash.prefill_indexer import POOL_GATHER_BLOCK
 from models.glm5_3_flash.prefill_indexer import indexer_score_token, indexer_topk
 from models.glm5_3_flash.prefill_indexer import sylvester_hadamard
 from models.glm5_3_flash.indexer_cache import golden_indexer_cache_write, golden_indexer_pool_write
@@ -79,7 +80,7 @@ def decode_indexer_step_test(
     index_slots: pl.Tensor[[T_DYN], pl.INT32],
     pool_token_slots: pl.Tensor[[POOLS_DYN, INDEX_KPOOL], pl.INT32],
     pool_slots: pl.Tensor[[POOLS_DYN], pl.INT32],
-    pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
+    pool_blocks: pl.Tensor[[POOLS_DYN], pl.INT32],
     seg_start: pl.Tensor[[T_DYN], pl.INT32],
     pool_count: pl.Tensor[[T_DYN], pl.INT32],
     tail_start: pl.Tensor[[T_DYN], pl.INT32],
@@ -114,7 +115,7 @@ def decode_indexer_step_test(
     kv_len.bind_dynamic(0, T_DYN)
     pool_token_slots.bind_dynamic(0, POOLS_DYN)
     pool_slots.bind_dynamic(0, POOLS_DYN)
-    pool_rows.bind_dynamic(0, POOLS_DYN)
+    pool_blocks.bind_dynamic(0, POOLS_DYN)
     pool_valid.bind_dynamic(0, POOLS_DYN)
     index_q.bind_dynamic(0, T_DYN)
     index_k.bind_dynamic(0, T_DYN)
@@ -149,7 +150,7 @@ def decode_indexer_step_test(
         hadamard,
         pool_cache,
         pool_scale,
-        pool_rows,
+        pool_blocks,
         head_weights,
         seg_start,
         pool_count,
@@ -222,20 +223,25 @@ def build_decode_indexer_step_specs(requests: int = 4, prior_counts: int | tuple
     def raw_rows_for(request, first, count):
         return [mapping[(request, position)] for position in range(first, first + count)]
 
+    # The pooled table is block-paged like the prefill fixtures: each compacted
+    # POOL_GATHER_BLOCK-row block lands contiguously at one physical base, and a
+    # pool's physical row derives from its compacted id.
+    blocks = width // POOL_GATHER_BLOCK
+    pool_table_rows = blocks * POOL_GATHER_BLOCK
+    block_bases = torch.randperm(blocks, generator=generator).to(torch.int32) * POOL_GATHER_BLOCK
+    seg_offsets = []
+    offset = 0
+    for count in new_counts:
+        seg_offsets.append(offset)
+        offset += count
+
+    def pool_row_of_id(compacted):
+        return int(block_bases[compacted // POOL_GATHER_BLOCK]) + compacted % POOL_GATHER_BLOCK
+
     pool_row_of = {}
-    taken = set()
-    pool_table_rows = ((pools_true + 3) // 4) * 4 + 4
-
-    def distinct_pool_row():
-        candidate = int(torch.randint(0, pool_table_rows, (1,), generator=generator))
-        while candidate in taken:
-            candidate = (candidate + 1) % pool_table_rows
-        taken.add(candidate)
-        return candidate
-
     for request in range(requests):
         for pool in range(new_counts[request]):
-            pool_row_of[(request, pool)] = distinct_pool_row()
+            pool_row_of[(request, pool)] = pool_row_of_id(seg_offsets[request] + pool)
 
     seg_start = torch.zeros(tokens, dtype=torch.int32)
     pool_count = torch.zeros(tokens, dtype=torch.int32)
@@ -252,13 +258,6 @@ def build_decode_indexer_step_specs(requests: int = 4, prior_counts: int | tuple
             tail_count[token] = length % INDEX_KPOOL
             tail_start[token] = length - int(tail_count[token])
             kv_len[token] = length
-
-    pool_rows = torch.zeros(width, dtype=torch.int32)
-    flat = 0
-    for request in range(requests):
-        for pool in range(new_counts[request]):
-            pool_rows[flat] = pool_row_of[(request, pool)]
-            flat += 1
 
     closing_slots = torch.full((requests, INDEX_KPOOL), -1, dtype=torch.int32)
     closing_dest = torch.zeros(requests, dtype=torch.int32)
@@ -355,7 +354,7 @@ def build_decode_indexer_step_specs(requests: int = 4, prior_counts: int | tuple
             "pool_token_slots", [requests, INDEX_KPOOL], torch.int32, init_value=lambda: closing_slots
         ),
         TensorSpec("pool_slots", [requests], torch.int32, init_value=lambda: closing_dest),
-        TensorSpec("pool_rows", [width], torch.int32, init_value=lambda: pool_rows),
+        TensorSpec("pool_blocks", [width // POOL_GATHER_BLOCK], torch.int32, init_value=lambda: block_bases),
         TensorSpec("seg_start", [tokens], torch.int32, init_value=lambda: seg_start),
         TensorSpec("pool_count", [tokens], torch.int32, init_value=lambda: pool_count),
         TensorSpec("tail_start", [tokens], torch.int32, init_value=lambda: tail_start),
@@ -419,7 +418,7 @@ def golden_decode_indexer_step_case(tensors):
         tensors["hadamard"],
         tensors["pool_cache"],
         tensors["pool_scale"],
-        tensors["pool_rows"],
+        tensors["pool_blocks"],
         tensors["head_weights"],
         tensors["seg_start"],
         tensors["pool_count"],
