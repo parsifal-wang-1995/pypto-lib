@@ -51,6 +51,7 @@ from models.glm5_3_flash.config import BLOCK_SIZE, D, INDEX_DIM, INDEX_H
 from models.glm5_3_flash.config import INDEX_KPOOL
 from models.glm5_3_flash.config import INDEX_STATE_WIDTH, KPOOL_SELECT_K, POOLS_DYN
 from models.glm5_3_flash.config import Q_LORA, TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN
+from models.glm5_3_flash.indexer_cache import POOL_SCALE_WIDTH
 from models.glm5_3_flash.indexer_cache import POOL_VALID_WIDTH
 from models.glm5_3_flash.indexer_cache import indexer_cache_write, indexer_pool_write
 from models.glm5_3_flash.prefill_indexer import LEAF
@@ -59,6 +60,7 @@ from models.glm5_3_flash.prefill_indexer import golden_indexer_score, golden_ind
 from models.glm5_3_flash.prefill_indexer import indexer_expand, indexer_proj
 from models.glm5_3_flash.prefill_indexer import indexer_score, indexer_topk, sylvester_hadamard
 from models.glm5_3_flash.indexer_cache import golden_indexer_cache_write, golden_indexer_pool_write
+from models.glm5_3_flash.quantization import quantize_per_token_int8
 
 
 @pl.jit
@@ -83,7 +85,8 @@ def decode_indexer_step_test(
     tail_count: pl.Tensor[[T_DYN], pl.INT32],
     kv_len: pl.Tensor[[T_DYN], pl.INT32],
     raw_cache: pl.InOut[pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32]],
-    pool_cache: pl.InOut[pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.BF16]],
+    pool_cache: pl.InOut[pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.INT8]],
+    pool_scale: pl.InOut[pl.Tensor[[POOLS_DYN, POOL_SCALE_WIDTH], pl.FP32]],
     pool_valid: pl.Out[pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32]],
     index_q: pl.Out[pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16]],
     index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16]],
@@ -137,11 +140,14 @@ def decode_indexer_step_test(
         gate_scores,
     )
     indexer_cache_write(index_k, gate_scores, index_slots, raw_cache)
-    indexer_pool_write(raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid)
+    indexer_pool_write(
+        raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_scale, pool_valid
+    )
     indexer_score(
         index_q,
         hadamard,
         pool_cache,
+        pool_scale,
         pool_rows,
         head_weights,
         seg_start,
@@ -157,6 +163,7 @@ def decode_indexer_step_test(
         gate_scores,
         raw_cache,
         pool_cache,
+        pool_scale,
         pool_valid,
         index_scores,
         selected_pools,
@@ -277,9 +284,21 @@ def build_decode_indexer_step_specs(requests: int = 4, prior_counts: int | tuple
         cache[:, :INDEX_DIM] = cache[:, :INDEX_DIM].bfloat16().float()
         return cache
 
+    # The pooled table starts as the quantized form earlier steps would have
+    # left behind: INT8 rows paired with their dequant scales, one draw feeding
+    # both so the pairs stay consistent.
+    prior_i8, prior_scale_col = quantize_per_token_int8(
+        torch.randn(pool_table_rows, INDEX_DIM, generator=generator, dtype=torch.float32)
+    )
+
     def init_pool_cache():
-        cache = torch.randn(pool_table_rows, INDEX_DIM, generator=generator).bfloat16()
-        return cache
+        return prior_i8
+
+    def init_pool_scale():
+        # The writer replicates the scale across all POOL_SCALE_WIDTH lanes and
+        # the scorer reads the row sum scaled by 1/8, so the prior table must
+        # carry the replication too.
+        return prior_scale_col.expand(-1, POOL_SCALE_WIDTH).contiguous().clone()
 
     shapes = {
         "w_q_b": (Q_LORA, INDEX_H * INDEX_DIM),
@@ -347,7 +366,10 @@ def build_decode_indexer_step_specs(requests: int = 4, prior_counts: int | tuple
             torch.float32,
             init_value=init_raw_cache,
         ),
-        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache),
+        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.int8, init_value=init_pool_cache),
+        TensorSpec(
+            "pool_scale", [pool_table_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale
+        ),
         TensorSpec("pool_valid", [requests, POOL_VALID_WIDTH], torch.int32),
         TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16),
         TensorSpec("index_k", [tokens, INDEX_DIM], torch.bfloat16),
@@ -380,19 +402,22 @@ def golden_decode_indexer_step_case(tensors):
     tensors["raw_cache"][:] = golden_indexer_cache_write(
         tensors["raw_cache"], index_k, gate_scores, tensors["index_slots"]
     )
-    pool_cache, pool_valid = golden_indexer_pool_write(
+    pool_cache, pool_scale, pool_valid = golden_indexer_pool_write(
         tensors["pool_cache"],
+        tensors["pool_scale"],
         tensors["raw_cache"],
         tensors["compress_ape"],
         tensors["pool_token_slots"],
         tensors["pool_slots"],
     )
     tensors["pool_cache"][:] = pool_cache
+    tensors["pool_scale"][:] = pool_scale
     tensors["pool_valid"][:] = pool_valid
     tensors["index_scores"][:] = golden_indexer_score(
         tensors["index_q"],
         tensors["hadamard"],
         tensors["pool_cache"],
+        tensors["pool_scale"],
         tensors["pool_rows"],
         tensors["head_weights"],
         tensors["seg_start"],
@@ -499,6 +524,48 @@ def main():
         exact = torch.equal(actual.cpu(), expected.cpu())
         return exact, "" if exact else "    integer output differs from golden"
 
+    def topk_indices_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+        """Tie-aware position compare for the expanded front-packed rows.
+
+        A near-boundary score cluster can reshuffle two pools whose scores each
+        sit inside the scorer's own tolerance; the swap is legal exactly when
+        the swapped positions' paired scores agree under the same allclose rule
+        that certified ``index_scores``. Tail and padding lanes are deterministic
+        given the inputs, so any mismatch there fails outright, and every actual
+        row must keep the front-packed ABI.
+        """
+        a = actual.cpu()
+        e = expected.cpu()
+        if torch.equal(a, e):
+            return True, ""
+        scores = actual_outputs["index_scores"].float().cpu()
+        seg0 = inputs["seg_start"].long().unsqueeze(1)
+        kv_len = inputs["kv_len"].long().unsqueeze(1)
+        hist_len = (kv_len // INDEX_KPOOL) * INDEX_KPOOL
+        live = (a >= 0).sum(dim=1)
+        rows = a.shape[0]
+        for row in range(rows):
+            if not ((a[row, : live[row]] >= 0).all() and (a[row, live[row] :] == -1).all()):
+                return False, f"    row {row} violates the front-packed ABI"
+
+        def lane_scores(x):
+            pool = x.clamp(min=0) // INDEX_KPOOL
+            cols = (pool + seg0).clamp(0, scores.shape[1] - 1)
+            paired = torch.gather(scores, 1, cols)
+            is_hist = (x >= 0) & (x < hist_len)
+            return torch.where(is_hist, paired, torch.full_like(paired, -torch.inf))
+
+        mismatch = a != e
+        both_hist = (a >= 0) & (a < hist_len) & (e >= 0) & (e < hist_len)
+        sa, se = lane_scores(a), lane_scores(e)
+        tie_legal = (sa - se).abs() <= atol + rtol * torch.maximum(sa.abs(), se.abs())
+        illegal = mismatch & ~(both_hist & tie_legal)
+        if illegal.any():
+            n = int(illegal.sum())
+            first = illegal.nonzero()[0].tolist()
+            return False, f"    {n} lane(s) differ beyond the score tolerance, first at {first}"
+        return True, ""
+
     result = run(
         fn=decode_indexer_step_test,
         specs=build_decode_indexer_step_specs(args.requests),
@@ -514,12 +581,15 @@ def main():
             # The raw rows carry the projection rounding of the composed step,
             # unlike the standalone scatter, which moves bytes at zero tolerance.
             "raw_cache": ratio_allclose(atol=1e-3, rtol=1.0 / 64, max_error_ratio=0.01),
-            "pool_cache": ratio_allclose(atol=1e-3, rtol=1.0 / 64, max_error_ratio=0.01),
+            # The pooled table is quantized on write; the softmax transcendentals
+            # can flip a rint boundary, so allow a tiny tail of one-quantum flips.
+            "pool_cache": ratio_allclose(atol=1.0, rtol=0.0, max_error_ratio=0.005),
+            "pool_scale": ratio_allclose(atol=1e-6, rtol=1e-3, max_error_ratio=0.005),
             "pool_valid": exact_compare,
             "index_scores": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
             "selected_pools": selected_pools_compare,
             "selected_valid": exact_compare,
-            "topk_indices": exact_compare,
+            "topk_indices": topk_indices_compare,
         },
         compile_only=args.compile_only,
     )

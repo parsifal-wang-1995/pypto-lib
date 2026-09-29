@@ -97,6 +97,7 @@ from models.glm5_3_flash.config import INDEX_BLOCKS_DYN, INDEX_DIM, INDEX_H
 from models.glm5_3_flash.config import INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE
 from models.glm5_3_flash.config import KPOOL_SELECT_K, POOLS_DYN, Q_LORA, T_DYN
 from models.glm5_3_flash.config import TOPK_INDEX_WIDTH
+from models.glm5_3_flash.indexer_cache import POOL_SCALE_WIDTH
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
 
 # The sort tree: 2048-wide leaves are the donor's confirmed fault-free width, and
@@ -257,6 +258,7 @@ def golden_indexer_score(
     index_q: torch.Tensor,
     hadamard: torch.Tensor,
     pool_cache: torch.Tensor,
+    pool_scale: torch.Tensor,
     pool_rows: torch.Tensor,
     head_weights: torch.Tensor,
     seg_start: torch.Tensor,
@@ -264,10 +266,12 @@ def golden_indexer_score(
 ) -> torch.Tensor:
     """Head-weighted ReLU scores of every query against the pooled table.
 
-    The Hadamard rotation and both INT8 quantizations mirror the kernel op for
-    op — the reference ``Glm5NextTextIndexer`` scores in plain FP32, and the
-    quantized path is the a2a3 deployment numerics, so the golden carries the
-    quantization rather than approximating around it.
+    The pooled table arrives already quantized — INT8 keys with their per-row
+    dequant scales, written at pool close — and the Hadamard rotation and the
+    query INT8 quantization mirror the kernel op for op. The reference
+    ``Glm5NextTextIndexer`` scores in plain FP32, and the quantized path is the
+    a2a3 deployment numerics, so the golden carries the quantization rather than
+    approximating around it.
     """
     tokens = index_q.shape[0]
     pools = pool_rows.shape[0]
@@ -276,8 +280,9 @@ def golden_indexer_score(
         return scores
     rotated = index_q.float().reshape(tokens * INDEX_H, INDEX_DIM) @ hadamard.float()
     q_i8, q_scale = quantize_per_token_int8(rotated)
-    pool_keys = pool_cache[pool_rows.to(torch.long)].float()
-    k_i8, k_scale = quantize_per_token_int8(pool_keys)
+    gathered = pool_rows.to(torch.long)
+    k_i8 = pool_cache[gathered]
+    k_scale = pool_scale[gathered, 0:1]
     for token in range(tokens):
         visible = int(pool_count[token])
         if visible <= 0:
@@ -298,7 +303,8 @@ def golden_indexer_score(
 def indexer_score(
     index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
+    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
     pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
     head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
     seg_start: pl.Tensor[[T_DYN], pl.INT32],
@@ -308,11 +314,14 @@ def indexer_score(
     """Score every query row against its request's pooled keys.
 
     ``pool_rows`` maps each compacted pool id to its physical row in the paged
-    pooled table — the host lowers paging, the kernel gathers. The score matrix
-    width must be a multiple of :data:`LEAF` with at least one leaf of slack
-    beyond the last request's window, so the scorer's ``SCORE_C_TILE`` stores
-    and the top-k's leaf loads never address past the tensor. Every lane
-    outside a query's visible window stays at ``FP32_NEG_INF``.
+    pooled table — the host lowers paging, the kernel gathers. The table rows
+    are INT8 with per-row dequant scales, quantized once at pool close, so the
+    scorer only gathers them into contiguous scratch and never re-quantizes
+    (donor C8 shape). The score matrix width must be a multiple of
+    :data:`LEAF` with at least one leaf of slack beyond the last request's
+    window, so the scorer's ``SCORE_C_TILE`` stores and the top-k's leaf loads
+    never address past the tensor. Every lane outside a query's visible window
+    stays at ``FP32_NEG_INF``.
     """
     t_dim = pl.tensor.dim(index_q, 0)
     pools = pl.tensor.dim(pool_rows, 0)
@@ -342,30 +351,31 @@ def indexer_score(
         qh_half = pl.cast(qh_i32, target_type=pl.FP16, mode="round")
         q_i8[r0 : r0 + QH_MM_TILE, :] = pl.cast(qh_half, target_type=pl.INT8, mode="trunc")
 
-    # One pass over the pooled table gathers the scattered rows into contiguous
-    # GM scratch, then quantizes every candidate to INT8 plus a per-row dequant
-    # scale, donor C8 style, so the per-token score loops read plain GM slices
-    # and never re-quantize a row per query.
-    pool_src = pl.create_tensor([pools + SCORE_C_TILE, INDEX_DIM], dtype=pl.BF16)
-    for c_block in pl.spmd(pools // SCORE_C_TILE, name_hint="indexer_pool_gather"):
-        c0 = c_block * SCORE_C_TILE
-        for r in pl.range(SCORE_C_TILE):
-            member = pl.cast(pl.read(pool_rows, [c0 + r]), pl.INDEX)
-            pl.store(pl.load(pool_cache, [member, 0], [1, INDEX_DIM]), [c0 + r, 0], pool_src)
+    # One pass over the pooled table gathers the scattered INT8 rows and their
+    # scales into contiguous GM scratch so the per-token score loops read plain
+    # GM slices. The table is already quantized — nothing here re-quantizes.
+    # Row moves are Tensor slice-assignments: a tile-level TLOAD of an INT8 row
+    # hits an unsupported layout, and the donor reads its C8 cache the same way.
     pool_i8 = pl.create_tensor([pools + SCORE_C_TILE, INDEX_DIM], dtype=pl.INT8)
-    pool_scale = pl.create_tensor([pools + SCORE_C_TILE, 1], dtype=pl.FP32)
-    for c_block in pl.spmd(pools // SCORE_C_TILE, name_hint="indexer_pool_quant"):
-        c0 = c_block * SCORE_C_TILE
-        kv_tile = pl.cast(pool_src[c0 : c0 + SCORE_C_TILE, :], pl.FP32, mode="none")
-        kv_amax = pl.full([1, SCORE_C_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        kv_abs = pl.maximum(kv_tile, pl.neg(kv_tile))
-        kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_abs), [1, SCORE_C_TILE]))
-        scale_quant_row = pl.div(pl.full([1, SCORE_C_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
-        pool_scale[c0 : c0 + SCORE_C_TILE, :] = pl.reshape(pl.recip(scale_quant_row), [SCORE_C_TILE, 1])
-        kv_scaled = pl.row_expand_mul(kv_tile, pl.reshape(scale_quant_row, [SCORE_C_TILE, 1]))
-        kv_i32 = pl.cast(kv_scaled, target_type=pl.INT32, mode="rint")
-        kv_half = pl.cast(kv_i32, target_type=pl.FP16, mode="round")
-        pool_i8[c0 : c0 + SCORE_C_TILE, :] = pl.cast(kv_half, target_type=pl.INT8, mode="trunc")
+    pool_scale_g = pl.create_tensor([pools + SCORE_C_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32)
+    for c_block in pl.spmd(pools // SCORE_C_TILE, name_hint="indexer_pool_gather"):
+        c0 = pl.cast(c_block, pl.INT32) * SCORE_C_TILE
+        for r in pl.range(SCORE_C_TILE):
+            ri = pl.cast(r, pl.INT32)
+            row = pl.cast(c0 + ri, pl.INDEX)
+            member = pl.cast(pl.read(pool_rows, [c0 + ri]), pl.INDEX)
+            pool_i8[row : row + 1, :] = pool_cache[member : member + 1, :]
+            pool_scale_g[row : row + 1, :] = pool_scale[member : member + 1, :]
+    # Collapse the replicated scale lanes once, width-proportional work outside
+    # the per-token loop: a strided lane-0 column read is not a legal TLOAD, and
+    # reducing inside the score loop costs ~40-70 ns per (token, tile) step.
+    pool_scale_col = pl.create_tensor([pools + SCORE_C_TILE, 1], dtype=pl.FP32)
+    for c_block in pl.spmd(pools // SCORE_C_TILE, name_hint="indexer_pool_scale_pack"):
+        c0 = pl.cast(c_block, pl.INT32) * SCORE_C_TILE
+        c0_idx = pl.cast(c0, pl.INDEX)
+        sc8 = pool_scale_g[c0_idx : c0_idx + SCORE_C_TILE, :]
+        summed = pl.reshape(pl.row_sum(sc8), [SCORE_C_TILE, 1])
+        pool_scale_col[c0_idx : c0_idx + SCORE_C_TILE, :] = pl.mul(summed, 0.125)
 
     for token in pl.spmd(t_dim, name_hint="indexer_score_init"):
         for c0 in pl.range(0, pools, SCORE_INIT_COLS):
@@ -382,7 +392,7 @@ def indexer_score(
             weight_row = head_weights[token : token + 1, 0:INDEX_H]
             for c0 in pl.range(0, visible, SCORE_C_TILE):
                 kv_q_i8 = pool_i8[seg0 + c0 : seg0 + c0 + SCORE_C_TILE, :]
-                kv_cache_scale_dq = pool_scale[seg0 + c0 : seg0 + c0 + SCORE_C_TILE, :]
+                kv_cache_scale_dq = pool_scale_col[seg0 + c0 : seg0 + c0 + SCORE_C_TILE, :]
                 dots_i32 = pl.matmul(kv_q_i8, q_tile_i8, out_dtype=pl.INT32, b_trans=True)
                 dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
                 dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
@@ -681,7 +691,8 @@ def indexer_proj_test(
 def indexer_score_test(
     index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
+    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
     pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
     head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
     seg_start: pl.Tensor[[T_DYN], pl.INT32],
@@ -701,6 +712,7 @@ def indexer_score_test(
         index_q,
         hadamard,
         pool_cache,
+        pool_scale,
         pool_rows,
         head_weights,
         seg_start,
@@ -856,8 +868,19 @@ def build_indexer_score_specs(
     def init_index_q():
         return torch.randn(tokens, INDEX_H, INDEX_DIM, generator=generator).bfloat16()
 
+    # One draw feeds both tables so every INT8 row and its scale stay paired.
+    prior_i8, prior_scale_col = quantize_per_token_int8(
+        torch.randn(pool_table_rows, INDEX_DIM, generator=generator, dtype=torch.float32)
+    )
+
     def init_pool_cache():
-        return torch.randn(pool_table_rows, INDEX_DIM, generator=generator).bfloat16()
+        return prior_i8
+
+    def init_pool_scale():
+        # The writer replicates the scale across all POOL_SCALE_WIDTH lanes and
+        # the scorer reads the row sum scaled by 1/8, so the prior table must
+        # carry the replication too.
+        return prior_scale_col.expand(-1, POOL_SCALE_WIDTH).contiguous().clone()
 
     def init_head_weights():
         return torch.randn(tokens, INDEX_H, generator=generator)
@@ -865,7 +888,10 @@ def build_indexer_score_specs(
     return [
         TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16, init_value=init_index_q),
         TensorSpec("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard),
-        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache),
+        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.int8, init_value=init_pool_cache),
+        TensorSpec(
+            "pool_scale", [pool_table_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale
+        ),
         TensorSpec("pool_rows", [width], torch.int32, init_value=lambda: pool_rows),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32, init_value=init_head_weights),
         TensorSpec("seg_start", [tokens], torch.int32, init_value=lambda: seg_start),
@@ -993,6 +1019,7 @@ def golden_indexer_score_case(tensors):
         tensors["index_q"],
         tensors["hadamard"],
         tensors["pool_cache"],
+        tensors["pool_scale"],
         tensors["pool_rows"],
         tensors["head_weights"],
         tensors["seg_start"],

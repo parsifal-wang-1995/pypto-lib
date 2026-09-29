@@ -16,14 +16,17 @@ Two tables, written by two kernels, make up the DSA indexer's persistent state:
   authoritative record the pooled table is derived from: scoring never reads it, but
   every pool that closes is compressed from these rows, so re-pooling is always
   possible and the gate projections are never recomputed.
-* the **pooled key table** — one BF16 :data:`INDEX_DIM`-wide row per closed pool,
-  paged at :data:`INDEX_STATE_BLOCK_SIZE` pools per block. :func:`indexer_pool_write`
+* the **pooled key table** — one INT8 :data:`INDEX_DIM`-wide row per closed pool
+  plus one FP32 dequant scale per row (:data:`POOL_SCALE_WIDTH`-lane padded), paged
+  at :data:`INDEX_STATE_BLOCK_SIZE` pools per block. :func:`indexer_pool_write`
   closes pools: for one pool event it reads the four member raw rows, takes the
   learned per-dimension softmax ``softmax(gate_scores + ape)`` over the four lanes —
   the reference ``Glm5NextTextIndexer.get_pooled_states`` does this in FP32 — and
-  stores the weighted key. The score then reads this table directly, which is the
+  stores the weighted key quantized to INT8 with its scale, written once at close.
+  The score then reads this table directly and never re-quantizes it, which is the
   whole point of the layout: a query scans one pooled row per four tokens instead of
-  pooling on the fly.
+  pooling on the fly, and the quantization cost is paid once per pool rather than
+  once per scoring pass.
 
 A pool closes exactly when its fourth token is cached, so the write side is driven by
 **pool-close events**: prefill emits one event per pool the chunk completes, a decode
@@ -44,11 +47,11 @@ dense batch; a paged cache has no left padding, so this ABI drops it the way
 instead.
 
 FP32 keys and gates cost 1 KB per token per rank per DSA layer on the raw side and
-128 B per token on the pooled side. The a2a3 sibling quantizes its own indexer cache
-to INT8 with a per-row FP32 scale, which would take the pooled half from 256 B to
-about 64 B per four tokens. Treat that as a follow-up, not a default: the pooled key
-feeds a ``relu``-gated score whose sensitivity to INT8 has not been measured for this
-checkpoint.
+about 33 B per token on the pooled side (INT8 key plus the padded scale lane). The
+INT8 pooled row follows the a2a3 sibling's C8 shape exactly — its scorer proved the
+quantized pooled key is accuracy-neutral for the relu-gated score — and the INT8
+quantization runs per closed pool at write time, so the per-row work is identical
+to quantizing at score time while the per-pass cost disappears.
 """
 
 import sys
@@ -63,11 +66,22 @@ import torch
 from models.glm5_3_flash.config import BLOCK_SIZE, INDEX_BLOCKS_DYN, INDEX_DIM
 from models.glm5_3_flash.config import INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE
 from models.glm5_3_flash.config import INDEX_STATE_WIDTH, POOLS_DYN, TABLE_DYN, T_DYN
+from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.glm5_3_flash.quantization import quantize_per_token_int8
 
 
 # The per-event validity flag is one INT32 lane padded to the 32-byte minimum of
 # an a2a3 vector tile; the flag sits in column 0 and columns 1-7 stay zero.
 POOL_VALID_WIDTH = 8
+
+# The pooled table stores INT8 keys plus one FP32 dequant scale per row, written
+# once at pool close and read directly by the scorer. The scale lane is padded to
+# the same 32-byte minimum; the writer replicates the scale across all lanes and
+# the scorer reads column 0.
+POOL_SCALE_WIDTH = 8
+
+# Event rows quantized and scattered per block of the pool-write epilogue.
+POOL_QUANT_TILE = 64
 
 
 def golden_indexer_cache_write(
@@ -119,16 +133,22 @@ def indexer_cache_write(
 
 def golden_indexer_pool_write(
     pool_cache: torch.Tensor,
+    pool_scale: torch.Tensor,
     raw_cache: torch.Tensor,
     compress_ape: torch.Tensor,
     pool_token_slots: torch.Tensor,
     pool_slots: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Close each pool event: per-dimension softmax over its four gate lanes.
 
+    The pooled key is quantized to INT8 plus a per-row dequant scale at write
+    time, exactly the chain the kernel runs, so both outputs compare exactly.
+
     Args:
-        pool_cache: ``[POOL_TABLE * INDEX_STATE_BLOCK_SIZE, INDEX_DIM]`` pooled table
-            holding the prior state.
+        pool_cache: ``[POOL_TABLE * INDEX_STATE_BLOCK_SIZE, INDEX_DIM]`` INT8
+            pooled-key table holding the prior state.
+        pool_scale: ``[POOL_TABLE * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH]``
+            FP32 per-row dequant scales holding the prior state.
         raw_cache: ``[TABLE * BLOCK_SIZE, INDEX_STATE_WIDTH]`` raw support table.
         compress_ape: ``[INDEX_KPOOL, INDEX_DIM]`` learned pool-lane bias.
         pool_token_slots: ``[events, INDEX_KPOOL]`` physical raw row of each member
@@ -136,23 +156,28 @@ def golden_indexer_pool_write(
         pool_slots: ``[events]`` destination pooled row of each event.
 
     Returns:
-        The updated pool table and the per-event validity (all four members present).
+        The updated INT8 table, the updated scale table and the per-event
+        validity (all four members present).
     """
     updated = pool_cache.clone()
+    updated_scale = pool_scale.clone()
     valid = torch.zeros(pool_slots.numel(), POOL_VALID_WIDTH, dtype=torch.int32)
     for event in range(pool_slots.numel()):
         members = pool_token_slots[event].to(torch.long)
         destination = int(pool_slots[event])
-        if bool((members >= 0).all()):
+        present = bool((members >= 0).all())
+        if present:
             keys = raw_cache[members, 0:INDEX_DIM].float()
             gates = raw_cache[members, INDEX_DIM:].float()
             probabilities = torch.softmax(gates + compress_ape.float(), dim=0)
-            updated[destination] = (probabilities * keys).sum(dim=0).to(pool_cache.dtype)
-            valid[event, 0] = 1
+            pooled = (probabilities * keys).sum(dim=0, keepdim=True)
         else:
-            updated[destination] = 0
-            valid[event, 0] = 0
-    return updated, valid
+            pooled = torch.zeros(1, INDEX_DIM)
+        key_i8, key_scale = quantize_per_token_int8(pooled)
+        updated[destination] = key_i8[0]
+        updated_scale[destination, :] = key_scale[0, 0]
+        valid[event, 0] = 1 if present else 0
+    return updated, updated_scale, valid
 
 
 @pl.jit.incore
@@ -160,11 +185,20 @@ def _indexer_pool_write_event(
     raw_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     pool_token_slots: pl.Tensor[[POOLS_DYN, INDEX_KPOOL], pl.INT32],
-    pool_slots: pl.Tensor[[POOLS_DYN], pl.INT32],
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16],
+    pool_stage: pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.FP32],
     pool_valid: pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32],
 ) -> None:
-    """Close one pool event; the caller gives this scope one block per event."""
+    """Close one pool event; the caller gives this scope one block per event.
+
+    The softmax runs per dimension over the four pool lanes in FP32, matching the
+    reference numerics: ``weights = softmax(gate + ape)`` along the lane axis, then
+    ``pool_key = sum(weights * key)``. The FP32 pooled key lands in the
+    contiguous ``pool_stage`` row of its event; a second scope quantizes the
+    staged rows to INT8 plus a dequant scale and scatters them to the paged
+    destinations. An event with a ``-1`` member slot is a padded pool: it stages a
+    zero row and reports ``pool_valid = 0`` so the scorer can drop it. The staged
+    row is always written, which keeps the epilogue's input fully defined.
+    """
     event = pl.tile.get_block_idx()
     slot0 = pl.read(pool_token_slots, [event, 0])
     slot1 = pl.read(pool_token_slots, [event, 1])
@@ -175,7 +209,6 @@ def _indexer_pool_write_event(
     # tile, the narrowest store the 32-byte vector alignment accepts.
     valid_flag = pl.cast(pl.min(pl.max(members_present, 0), 1), pl.INT32)
     flag_tile = pl.tile.full([1, POOL_VALID_WIDTH], dtype=pl.INT32, value=0)
-    destination = pl.cast(pl.read(pool_slots, [event]), pl.INDEX)
     if members_present >= 0:
         # Per-lane logits and keys, kept as [1, INDEX_DIM] rows so every step is
         # an elementwise row operation; the softmax reduces over the four lanes.
@@ -206,11 +239,11 @@ def _indexer_pool_write_event(
         weighted_sum = pl.add(weighted_sum, pl.mul(weight2, key2))
         weighted_sum = pl.add(weighted_sum, pl.mul(weight3, key3))
         pool_key = pl.div(weighted_sum, denominator)
-        pl.store(pl.cast(pool_key, pl.BF16, mode="rint"), [destination, 0], pool_cache)
+        pl.store(pool_key, [event, 0], pool_stage)
         pl.tile.write(flag_tile, [0, 0], valid_flag)
     else:
-        zero_row = pl.tile.full([1, INDEX_DIM], dtype=pl.BF16, value=0.0)
-        pl.store(zero_row, [destination, 0], pool_cache)
+        zero_row = pl.tile.full([1, INDEX_DIM], dtype=pl.FP32, value=0.0)
+        pl.store(zero_row, [event, 0], pool_stage)
     pl.store(flag_tile, [event, 0], pool_valid)
 
 
@@ -220,25 +253,53 @@ def indexer_pool_write(
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     pool_token_slots: pl.Tensor[[POOLS_DYN, INDEX_KPOOL], pl.INT32],
     pool_slots: pl.Tensor[[POOLS_DYN], pl.INT32],
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
+    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
     pool_valid: pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32],
 ):
-    """Write one pooled key row per pool-close event, one block per event.
+    """Write one quantized pooled key row per pool-close event.
 
-    The softmax runs per dimension over the four pool lanes in FP32, matching the
-    reference numerics: ``weights = softmax(gate + ape)`` along the lane axis, then
-    ``pool_key = sum(weights * key)``. An event with a ``-1`` member slot is a padded
-    pool: it writes a zero row and reports ``pool_valid = 0`` so the scorer can drop
-    it. The destination row itself is always written, which keeps the output fully
-    defined for the golden harness.
+    The pooled table stores INT8 keys plus one FP32 dequant scale per row, both
+    written once here at pool close — the scorer reads them directly and never
+    re-quantizes the table (donor C8 shape). The softmax runs per dimension over
+    the four pool lanes in FP32; each event stages its FP32 pooled key
+    contiguously, then a block-parallel epilogue quantizes rows of
+    :data:`POOL_QUANT_TILE` events at a time and scatters INT8, scale and
+    validity to the paged destinations. A padded event quantizes a zero row and
+    reports ``pool_valid = 0``; the destination row itself is always written,
+    which keeps the outputs fully defined for the golden harness.
 
     Returns the region's TaskId so the scorer can order against the pool writes.
     """
     events = pl.tensor.dim(pool_token_slots, 0)
+    stage_rows = ((events + POOL_QUANT_TILE - 1) // POOL_QUANT_TILE) * POOL_QUANT_TILE
+    pool_stage = pl.create_tensor([stage_rows, INDEX_DIM], dtype=pl.FP32)
     with pl.spmd(events, name_hint="indexer_pool_write") as pool_tid:
-        _indexer_pool_write_event(
-            raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid
+        _indexer_pool_write_event(raw_cache, compress_ape, pool_token_slots, pool_stage, pool_valid)
+    for blk in pl.spmd((events + POOL_QUANT_TILE - 1) // POOL_QUANT_TILE, name_hint="indexer_pool_quant"):
+        # Slicing wants INDEX offsets; the INT32 twin feeds the arithmetic.
+        e0 = pl.cast(blk, pl.INT32) * POOL_QUANT_TILE
+        e0_idx = pl.cast(e0, pl.INDEX)
+        staged = pool_stage[e0_idx : e0_idx + POOL_QUANT_TILE, :]
+        staged_abs = pl.maximum(staged, pl.neg(staged))
+        amax = pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        amax = pl.maximum(amax, pl.reshape(pl.row_max(staged_abs), [1, POOL_QUANT_TILE]))
+        scale_quant_row = pl.div(pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), amax)
+        staged_scaled = pl.row_expand_mul(staged, pl.reshape(scale_quant_row, [POOL_QUANT_TILE, 1]))
+        staged_i32 = pl.cast(staged_scaled, target_type=pl.INT32, mode="rint")
+        staged_half = pl.cast(staged_i32, target_type=pl.FP16, mode="round")
+        staged_i8 = pl.cast(staged_half, target_type=pl.INT8, mode="trunc")
+        scale_dq_col = pl.reshape(pl.recip(scale_quant_row), [POOL_QUANT_TILE, 1])
+        scale_pad = pl.row_expand_mul(
+            pl.full([POOL_QUANT_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32, value=1.0), scale_dq_col
         )
+        for e in pl.range(POOL_QUANT_TILE):
+            ei = pl.cast(e, pl.INT32)
+            if e0 + ei < events:
+                ei_idx = pl.cast(ei, pl.INDEX)
+                dest = pl.cast(pl.read(pool_slots, [e0 + ei]), pl.INDEX)
+                pool_cache[dest : dest + 1, :] = staged_i8[ei_idx : ei_idx + 1, :]
+                pool_scale[dest : dest + 1, :] = scale_pad[ei_idx : ei_idx + 1, :]
     return pool_tid
 
 
@@ -263,15 +324,18 @@ def indexer_pool_write_test(
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     pool_token_slots: pl.Tensor[[POOLS_DYN, INDEX_KPOOL], pl.INT32],
     pool_slots: pl.Tensor[[POOLS_DYN], pl.INT32],
-    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16]],
+    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8]],
+    pool_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32]],
     pool_valid: pl.Out[pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32]],
 ):
     """Close every pool event of one dispatch for golden.run validation."""
     pool_token_slots.bind_dynamic(0, POOLS_DYN)
     pool_slots.bind_dynamic(0, POOLS_DYN)
     pool_valid.bind_dynamic(0, POOLS_DYN)
-    indexer_pool_write(raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid)
-    return pool_cache, pool_valid
+    indexer_pool_write(
+        raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_scale, pool_valid
+    )
+    return pool_cache, pool_scale, pool_valid
 
 
 def build_indexer_cache_write_specs(tokens: int = 24, pages: int = 4):
@@ -348,8 +412,18 @@ def build_indexer_pool_write_specs(events: int = 6, raw_pages: int = 2, pool_pag
         chosen = torch.randperm(pool_rows, generator=generator)[:events]
         return chosen.to(torch.int32)
 
+    # One draw feeds both tables so the prior INT8 rows and their scales match.
+    prior_i8, prior_scale_col = quantize_per_token_int8(
+        torch.randn(pool_rows, INDEX_DIM, generator=generator, dtype=torch.float32)
+    )
+
     def init_pool_cache():
-        return torch.randn(pool_rows, INDEX_DIM, generator=generator, dtype=torch.float32).bfloat16()
+        return prior_i8
+
+    def init_pool_scale():
+        scale = torch.zeros(pool_rows, POOL_SCALE_WIDTH)
+        scale[:, 0] = prior_scale_col[:, 0]
+        return scale
 
     return [
         TensorSpec("raw_cache", [raw_rows, INDEX_STATE_WIDTH], torch.float32, init_value=init_raw_cache),
@@ -361,7 +435,8 @@ def build_indexer_pool_write_specs(events: int = 6, raw_pages: int = 2, pool_pag
             init_value=init_pool_token_slots,
         ),
         TensorSpec("pool_slots", [events], torch.int32, init_value=init_pool_slots),
-        TensorSpec("pool_cache", [pool_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache),
+        TensorSpec("pool_cache", [pool_rows, INDEX_DIM], torch.int8, init_value=init_pool_cache),
+        TensorSpec("pool_scale", [pool_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale),
         TensorSpec("pool_valid", [events, POOL_VALID_WIDTH], torch.int32),
     ]
 
@@ -374,15 +449,17 @@ def golden_indexer_cache_write_case(tensors):
 
 
 def golden_indexer_pool_write_case(tensors):
-    """Fill the expected pooled table and validity for :func:`build_indexer_pool_write_specs`."""
-    pool_cache, pool_valid = golden_indexer_pool_write(
+    """Fill the expected pooled tables and validity for :func:`build_indexer_pool_write_specs`."""
+    pool_cache, pool_scale, pool_valid = golden_indexer_pool_write(
         tensors["pool_cache"],
+        tensors["pool_scale"],
         tensors["raw_cache"],
         tensors["compress_ape"],
         tensors["pool_token_slots"],
         tensors["pool_slots"],
     )
     tensors["pool_cache"][:] = pool_cache
+    tensors["pool_scale"][:] = pool_scale
     tensors["pool_valid"][:] = pool_valid
 
 
@@ -403,7 +480,10 @@ def _self_check() -> None:
             assert torch.equal(updated[slot], expected), f"slot {slot} did not receive its row"
     assert torch.equal(updated[-1], cache[-1]), "a -1 slot wrapped into the last row"
 
-    pool_cache = torch.randn(8, INDEX_DIM).bfloat16()
+    pool_i8, pool_scale_col = quantize_per_token_int8(torch.randn(8, INDEX_DIM))
+    pool_cache = pool_i8
+    pool_scale = torch.zeros(8, POOL_SCALE_WIDTH)
+    pool_scale[:, 0] = pool_scale_col[:, 0]
     raw_cache = torch.cat(
         [
             torch.randn(32, INDEX_DIM).bfloat16().float(),
@@ -417,24 +497,32 @@ def _self_check() -> None:
         dtype=torch.int32,
     )
     pool_slots = torch.tensor([7, 3, 0, 5, 2], dtype=torch.int32)
-    new_cache, valid = golden_indexer_pool_write(pool_cache, raw_cache, ape, pool_token_slots, pool_slots)
+    new_cache, new_scale, valid = golden_indexer_pool_write(
+        pool_cache, pool_scale, raw_cache, ape, pool_token_slots, pool_slots
+    )
     assert valid[:, 0].tolist() == [1, 1, 1, 0, 1], valid
     members = pool_token_slots[0].long()
     weights = torch.softmax(raw_cache[members, INDEX_DIM:].float() + ape.float(), dim=0)
-    expected = (weights * raw_cache[members, 0:INDEX_DIM].float()).sum(dim=0)
-    assert torch.allclose(new_cache[7].float(), expected, atol=1e-2), "pool 0 mismatch"
-    assert torch.equal(new_cache[5], torch.zeros(INDEX_DIM, dtype=torch.bfloat16))
+    expected = (weights * raw_cache[members, 0:INDEX_DIM].float()).sum(dim=0, keepdim=True)
+    expected_i8, expected_scale = quantize_per_token_int8(expected)
+    assert torch.equal(new_cache[7], expected_i8[0]), "pool 0 INT8 bytes differ"
+    assert (new_scale[7] == expected_scale[0, 0]).all(), "pool 0 scale lanes differ"
+    zero_i8, zero_scale = quantize_per_token_int8(torch.zeros(1, INDEX_DIM))
+    assert torch.equal(new_cache[5], zero_i8[0].to(torch.int8)), "padded pool is not quantized zero"
+    assert (new_scale[5] == zero_scale[0, 0]).all(), "padded pool scale lanes differ"
     assert torch.equal(new_cache[1], pool_cache[1]), "an untouched pooled row changed"
+    assert torch.equal(new_scale[1], pool_scale[1]), "an untouched scale row changed"
     print("[GOLDEN] PASS indexer_cache self-check")
 
 
 def main():
     """Prove the goldens on CPU, then validate both writers on device.
 
-    The raw scatter is pure data movement, so it runs at zero tolerance. The pooled
-    row is an FP32 softmax rounded once to BF16; device and reference differ only in
-    transcendentals, which the BF16 rounding almost always absorbs, so the budget is
-    one BF16 ulp with a small outlier allowance.
+    The raw scatter is pure data movement, so it runs at zero tolerance. The
+    pooled key is an FP32 softmax quantized once to INT8 plus a dequant scale;
+    device and reference differ only in the softmax transcendentals, which
+    almost always lands on the same quantized byte — the budget allows a tiny
+    tail of one-quantum flips at rint boundaries.
     """
     import argparse
 
@@ -494,10 +582,14 @@ def main():
                 config={"platform": args.platform, "device_id": args.device},
                 rtol=1.0 / 64,
                 atol=1e-3,
+                # The quantization chain itself is deterministic, but the pooled
+                # FP32 key differs from the reference by one exp() ulp, which can
+                # flip a rint boundary: allow a tiny tail of one-quantum flips.
                 compare_fn=None
                 if args.bench
                 else {
-                    "pool_cache": ratio_allclose(atol=1e-3, rtol=1.0 / 64, max_error_ratio=0.01),
+                    "pool_cache": ratio_allclose(atol=1.0, rtol=0.0, max_error_ratio=0.005),
+                    "pool_scale": ratio_allclose(atol=1e-6, rtol=1e-3, max_error_ratio=0.005),
                 },
                 compile_only=args.compile_only,
             )
