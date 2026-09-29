@@ -123,6 +123,9 @@ SCORE_C_TILE = 64
 # whole group. The token count must be a multiple of SCORE_TOKEN_TILE.
 SCORE_TOKEN_TILE = 4
 SCORE_KV_TILE = 128
+# Width of the post-loop window-mask chunks; the score width always carries at
+# least one LEAF of slack, so full chunks never run past the tensor.
+SCORE_MASK_COLS = 2048
 # The pooled table is addressed in POOL_GATHER_BLOCK-row blocks: the host maps each
 # compacted block to one contiguous physical base row, so the gather moves whole
 # blocks instead of single scattered rows.
@@ -369,13 +372,15 @@ def _indexer_score_prepare(
     # Collapse the replicated scale lanes once, width-proportional work outside
     # the per-token loop: a strided lane-0 column read is not a legal TLOAD, and
     # reducing inside the score loop costs ~40-70 ns per (token, tile) step.
+    # The softmax scale rides along here (it is per-row constant), so the score
+    # loops never multiply it per tile.
     pool_scale_col = pl.create_tensor([pools + SCORE_C_TILE, 1], dtype=pl.FP32)
     for c_block in pl.spmd(pools // SCORE_C_TILE, name_hint="indexer_pool_scale_pack"):
         c0 = pl.cast(c_block, pl.INT32) * SCORE_C_TILE
         c0_idx = pl.cast(c0, pl.INDEX)
         sc8 = pool_scale_g[c0_idx : c0_idx + SCORE_C_TILE, :]
         summed = pl.reshape(pl.row_sum(sc8), [SCORE_C_TILE, 1])
-        pool_scale_col[c0_idx : c0_idx + SCORE_C_TILE, :] = pl.mul(summed, 0.125)
+        pool_scale_col[c0_idx : c0_idx + SCORE_C_TILE, :] = pl.mul(summed, 0.125 * SOFTMAX_SCALE)
 
     for token in pl.spmd(t_dim, name_hint="indexer_score_init"):
         for c0 in pl.range(0, pools, SCORE_INIT_COLS):
@@ -418,9 +423,15 @@ def indexer_score(
     # Donor CP shape: one block owns SCORE_TOKEN_TILE consecutive queries and
     # walks the group's combined pool span in SCORE_KV_TILE-wide tiles, so each
     # gathered key tile is loaded once and multiplied against every query in the
-    # group (the donor's SCORE_TOKEN_TILE/CACHE_TILE reuse). A query only stores
-    # the tile lanes its causal window covers; the init scope already filled
-    # everything else with the finite negative sentinel.
+    # group (the donor's SCORE_TOKEN_TILE/CACHE_TILE reuse). The per-tile
+    # epilogue is minimal — cast, the pre-scaled key dequant, relu, one fused
+    # query multiplier (scale times head weight), the head row_sum — because
+    # per-tile vector ops dominate this loop (E8 anchors: the mmads alone run
+    # 15x faster than the full score). Overlap tiles store their whole lane
+    # span unmasked; a post-loop chunked pass re-applies each query's window
+    # once per 2048 lanes instead of once per 128-lane tile. Lanes the pass
+    # covers but no tile wrote (or tiles before a request's segment) already
+    # hold the init sentinel, and the read-modify-write is idempotent there.
     for g in pl.spmd(t_dim // SCORE_TOKEN_TILE, name_hint="indexer_score"):
         g0 = pl.cast(g, pl.INT32) * SCORE_TOKEN_TILE
         t0 = pl.cast(g0, pl.INDEX)
@@ -444,23 +455,24 @@ def indexer_score(
         q_b = q_i8[t1 * INDEX_H : t1 * INDEX_H + INDEX_H, :]
         q_c = q_i8[t2 * INDEX_H : t2 * INDEX_H + INDEX_H, :]
         q_d = q_i8[t3 * INDEX_H : t3 * INDEX_H + INDEX_H, :]
+        # One fused per-head multiplier: the dequant scale is positive, so it
+        # commutes with the relu and folds with the head weight into one factor.
         qs_a = pl.reshape(q_scale_dq[t0 * INDEX_H : t0 * INDEX_H + INDEX_H, :], [1, INDEX_H])
         qs_b = pl.reshape(q_scale_dq[t1 * INDEX_H : t1 * INDEX_H + INDEX_H, :], [1, INDEX_H])
         qs_c = pl.reshape(q_scale_dq[t2 * INDEX_H : t2 * INDEX_H + INDEX_H, :], [1, INDEX_H])
         qs_d = pl.reshape(q_scale_dq[t3 * INDEX_H : t3 * INDEX_H + INDEX_H, :], [1, INDEX_H])
-        wt_a = head_weights[g0 : g0 + 1, 0:INDEX_H]
-        wt_b = head_weights[g0 + 1 : g0 + 2, 0:INDEX_H]
-        wt_c = head_weights[g0 + 2 : g0 + 3, 0:INDEX_H]
-        wt_d = head_weights[g0 + 3 : g0 + 4, 0:INDEX_H]
+        qsw_a = pl.mul(qs_a, head_weights[g0 : g0 + 1, 0:INDEX_H])
+        qsw_b = pl.mul(qs_b, head_weights[g0 + 1 : g0 + 2, 0:INDEX_H])
+        qsw_c = pl.mul(qs_c, head_weights[g0 + 2 : g0 + 3, 0:INDEX_H])
+        qsw_d = pl.mul(qs_d, head_weights[g0 + 3 : g0 + 4, 0:INDEX_H])
+        mask_ones = pl.full([1, SCORE_MASK_COLS], dtype=pl.FP32, value=1.0)
+        mask_neg = pl.full([1, SCORE_MASK_COLS], dtype=pl.FP32, value=FP32_NEG_INF)
         for c0 in pl.range(0, span_end, SCORE_KV_TILE):
             c0_i = pl.cast(c0, pl.INT32)
             c0_idx = pl.cast(c0_i, pl.INDEX)
             kv_q_i8 = pool_i8[c0_idx : c0_idx + SCORE_KV_TILE, :]
             kv_cache_scale_dq = pool_scale_col[c0_idx : c0_idx + SCORE_KV_TILE, :]
             tile_hi = c0_i + SCORE_KV_TILE
-            lane = pl.arange(c0_i, [1, SCORE_KV_TILE], dtype=pl.INT32)
-            mask_ones = pl.full([1, SCORE_KV_TILE], dtype=pl.FP32, value=1.0)
-            mask_neg = pl.full([1, SCORE_KV_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
 
             lo = pl.cast(pl.max(seg_a, c0_i), pl.INT32)
             hi = pl.cast(pl.min(end_a, tile_hi), pl.INT32)
@@ -468,16 +480,10 @@ def indexer_score(
                 dots_i32 = pl.matmul(kv_q_i8, q_a, out_dtype=pl.INT32, b_trans=True)
                 dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
                 dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                dots = pl.col_expand_mul(dots, qs_a)
-                dots = pl.mul(dots, SOFTMAX_SCALE)
-                relu = pl.maximum(dots, pl.mul(dots, 0.0))
-                weighted = pl.col_expand_mul(relu, wt_a)
+                relu = pl.maximum(dots, 0.0)
+                weighted = pl.col_expand_mul(relu, qsw_a)
                 row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
-                keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, lo), 1), 0), 1)
-                keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, hi)), 0), 1)
-                keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
-                masked = pl.add(pl.mul(row_score, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
-                index_scores[t0 : t0 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = masked
+                index_scores[t0 : t0 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = row_score
 
             lo = pl.cast(pl.max(seg_b, c0_i), pl.INT32)
             hi = pl.cast(pl.min(end_b, tile_hi), pl.INT32)
@@ -485,16 +491,10 @@ def indexer_score(
                 dots_i32 = pl.matmul(kv_q_i8, q_b, out_dtype=pl.INT32, b_trans=True)
                 dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
                 dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                dots = pl.col_expand_mul(dots, qs_b)
-                dots = pl.mul(dots, SOFTMAX_SCALE)
-                relu = pl.maximum(dots, pl.mul(dots, 0.0))
-                weighted = pl.col_expand_mul(relu, wt_b)
+                relu = pl.maximum(dots, 0.0)
+                weighted = pl.col_expand_mul(relu, qsw_b)
                 row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
-                keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, lo), 1), 0), 1)
-                keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, hi)), 0), 1)
-                keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
-                masked = pl.add(pl.mul(row_score, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
-                index_scores[t1 : t1 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = masked
+                index_scores[t1 : t1 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = row_score
 
             lo = pl.cast(pl.max(seg_c, c0_i), pl.INT32)
             hi = pl.cast(pl.min(end_c, tile_hi), pl.INT32)
@@ -502,16 +502,10 @@ def indexer_score(
                 dots_i32 = pl.matmul(kv_q_i8, q_c, out_dtype=pl.INT32, b_trans=True)
                 dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
                 dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                dots = pl.col_expand_mul(dots, qs_c)
-                dots = pl.mul(dots, SOFTMAX_SCALE)
-                relu = pl.maximum(dots, pl.mul(dots, 0.0))
-                weighted = pl.col_expand_mul(relu, wt_c)
+                relu = pl.maximum(dots, 0.0)
+                weighted = pl.col_expand_mul(relu, qsw_c)
                 row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
-                keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, lo), 1), 0), 1)
-                keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, hi)), 0), 1)
-                keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
-                masked = pl.add(pl.mul(row_score, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
-                index_scores[t2 : t2 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = masked
+                index_scores[t2 : t2 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = row_score
 
             lo = pl.cast(pl.max(seg_d, c0_i), pl.INT32)
             hi = pl.cast(pl.min(end_d, tile_hi), pl.INT32)
@@ -519,16 +513,45 @@ def indexer_score(
                 dots_i32 = pl.matmul(kv_q_i8, q_d, out_dtype=pl.INT32, b_trans=True)
                 dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
                 dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                dots = pl.col_expand_mul(dots, qs_d)
-                dots = pl.mul(dots, SOFTMAX_SCALE)
-                relu = pl.maximum(dots, pl.mul(dots, 0.0))
-                weighted = pl.col_expand_mul(relu, wt_d)
+                relu = pl.maximum(dots, 0.0)
+                weighted = pl.col_expand_mul(relu, qsw_d)
                 row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
-                keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, lo), 1), 0), 1)
-                keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, hi)), 0), 1)
-                keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
-                masked = pl.add(pl.mul(row_score, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
-                index_scores[t3 : t3 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = masked
+                index_scores[t3 : t3 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = row_score
+
+        # Post-loop window mask, one chunked pass per group instead of a mask
+        # chain per (token, tile). Full chunks stay inside the tensor because
+        # the width carries at least one LEAF of slack beyond every span.
+        for m0 in pl.range(0, span_end, SCORE_MASK_COLS):
+            m0_i = pl.cast(m0, pl.INT32)
+            m0_idx = pl.cast(m0_i, pl.INDEX)
+            lane = pl.arange(m0_i, [1, SCORE_MASK_COLS], dtype=pl.INT32)
+            keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, seg_a), 1), 0), 1)
+            keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, end_a)), 0), 1)
+            keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
+            row = index_scores[t0 : t0 + 1, m0_idx : m0_idx + SCORE_MASK_COLS]
+            fixed = pl.add(pl.mul(row, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
+            index_scores[t0 : t0 + 1, m0_idx : m0_idx + SCORE_MASK_COLS] = fixed
+
+            keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, seg_b), 1), 0), 1)
+            keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, end_b)), 0), 1)
+            keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
+            row = index_scores[t1 : t1 + 1, m0_idx : m0_idx + SCORE_MASK_COLS]
+            fixed = pl.add(pl.mul(row, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
+            index_scores[t1 : t1 + 1, m0_idx : m0_idx + SCORE_MASK_COLS] = fixed
+
+            keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, seg_c), 1), 0), 1)
+            keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, end_c)), 0), 1)
+            keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
+            row = index_scores[t2 : t2 + 1, m0_idx : m0_idx + SCORE_MASK_COLS]
+            fixed = pl.add(pl.mul(row, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
+            index_scores[t2 : t2 + 1, m0_idx : m0_idx + SCORE_MASK_COLS] = fixed
+
+            keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, seg_d), 1), 0), 1)
+            keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, end_d)), 0), 1)
+            keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
+            row = index_scores[t3 : t3 + 1, m0_idx : m0_idx + SCORE_MASK_COLS]
+            fixed = pl.add(pl.mul(row, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
+            index_scores[t3 : t3 + 1, m0_idx : m0_idx + SCORE_MASK_COLS] = fixed
 
 
 @pl.jit.inline
@@ -562,17 +585,17 @@ def indexer_score_token(
             seg0 = pl.read(seg_start, [token])
             q_tile_i8 = q_i8[token * INDEX_H : token * INDEX_H + INDEX_H, :]
             q_scale_row = pl.reshape(q_scale_dq[token * INDEX_H : token * INDEX_H + INDEX_H, :], [1, INDEX_H])
-            weight_row = head_weights[token : token + 1, 0:INDEX_H]
+            # Fused per-head multiplier; the softmax scale already rides on the
+            # packed key scale, and the positive scale commutes with the relu.
+            qsw = pl.mul(q_scale_row, head_weights[token : token + 1, 0:INDEX_H])
             for c0 in pl.range(0, visible, SCORE_C_TILE):
                 kv_q_i8 = pool_i8[seg0 + c0 : seg0 + c0 + SCORE_C_TILE, :]
                 kv_cache_scale_dq = pool_scale_col[seg0 + c0 : seg0 + c0 + SCORE_C_TILE, :]
                 dots_i32 = pl.matmul(kv_q_i8, q_tile_i8, out_dtype=pl.INT32, b_trans=True)
                 dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
                 dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                dots = pl.col_expand_mul(dots, q_scale_row)
-                dots = pl.mul(dots, SOFTMAX_SCALE)
-                relu = pl.maximum(dots, pl.mul(dots, 0.0))
-                weighted = pl.col_expand_mul(relu, weight_row)
+                relu = pl.maximum(dots, 0.0)
+                weighted = pl.col_expand_mul(relu, qsw)
                 row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_C_TILE])
                 valid_len = pl.min(SCORE_C_TILE, visible - c0)
                 masked = pl.fillpad(pl.set_validshape(row_score, 1, valid_len), pad_value=pl.PadValue.min)
