@@ -118,6 +118,11 @@ PROJ_K_TILE = 128
 Q_OUT_TILE = 256
 QH_MM_TILE = 64
 SCORE_C_TILE = 64
+# Donor CP scorer shape: one block walks SCORE_TOKEN_TILE queries through
+# SCORE_KV_TILE-wide key tiles, loading each gathered key tile once for the
+# whole group. The token count must be a multiple of SCORE_TOKEN_TILE.
+SCORE_TOKEN_TILE = 4
+SCORE_KV_TILE = 128
 SCORE_INIT_COLS = 1024
 EXPAND_W_TILE = 256
 EXPAND_TAIL_CHUNK = 8  # covers the last lanes in one aligned tile
@@ -300,28 +305,19 @@ def golden_indexer_score(
 
 
 @pl.jit.inline
-def indexer_score(
+def _indexer_score_prepare(
     index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
     pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
     pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
-    head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
-    seg_start: pl.Tensor[[T_DYN], pl.INT32],
-    pool_count: pl.Tensor[[T_DYN], pl.INT32],
     index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
 ):
-    """Score every query row against its request's pooled keys.
+    """Shared scorer prologue: query rotation/quant, pool gather and init.
 
-    ``pool_rows`` maps each compacted pool id to its physical row in the paged
-    pooled table — the host lowers paging, the kernel gathers. The table rows
-    are INT8 with per-row dequant scales, quantized once at pool close, so the
-    scorer only gathers them into contiguous scratch and never re-quantizes
-    (donor C8 shape). The score matrix width must be a multiple of
-    :data:`LEAF` with at least one leaf of slack beyond the last request's
-    window, so the scorer's ``SCORE_C_TILE`` stores and the top-k's leaf loads
-    never address past the tensor. Every lane outside a query's visible window
-    stays at ``FP32_NEG_INF``.
+    Returns the INT8 query rows with their dequant scales and the contiguous
+    INT8/scale scratch the score loops read, with the score matrix pre-filled
+    at the finite negative sentinel.
     """
     t_dim = pl.tensor.dim(index_q, 0)
     pools = pl.tensor.dim(pool_rows, 0)
@@ -382,6 +378,179 @@ def indexer_score(
             index_scores[token : token + 1, c0 : c0 + SCORE_INIT_COLS] = pl.full(
                 [1, SCORE_INIT_COLS], dtype=pl.FP32, value=FP32_NEG_INF
             )
+    return q_i8, q_scale_dq, pool_i8, pool_scale_col
+
+
+@pl.jit.inline
+def indexer_score(
+    index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
+    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
+    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
+    pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
+    head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
+    seg_start: pl.Tensor[[T_DYN], pl.INT32],
+    pool_count: pl.Tensor[[T_DYN], pl.INT32],
+    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
+):
+    """Score every query row against its request's pooled keys, prefill shape.
+
+    ``pool_rows`` maps each compacted pool id to its physical row in the paged
+    pooled table — the host lowers paging, the kernel gathers. The table rows
+    are INT8 with per-row dequant scales, quantized once at pool close, so the
+    scorer only gathers them into contiguous scratch and never re-quantizes
+    (donor C8 shape). The score matrix width must be a multiple of
+    :data:`LEAF` with at least one leaf of slack beyond the last request's
+    window, so the scorer's stores and the top-k's leaf loads never address
+    past the tensor. Every lane outside a query's visible window stays at
+    ``FP32_NEG_INF``. The token count must be a multiple of
+    :data:`SCORE_TOKEN_TILE`.
+    """
+    t_dim = pl.tensor.dim(index_q, 0)
+    q_i8, q_scale_dq, pool_i8, pool_scale_col = _indexer_score_prepare(
+        index_q, hadamard, pool_cache, pool_scale, pool_rows, index_scores
+    )
+
+    # Donor CP shape: one block owns SCORE_TOKEN_TILE consecutive queries and
+    # walks the group's combined pool span in SCORE_KV_TILE-wide tiles, so each
+    # gathered key tile is loaded once and multiplied against every query in the
+    # group (the donor's SCORE_TOKEN_TILE/CACHE_TILE reuse). A query only stores
+    # the tile lanes its causal window covers; the init scope already filled
+    # everything else with the finite negative sentinel.
+    for g in pl.spmd(t_dim // SCORE_TOKEN_TILE, name_hint="indexer_score"):
+        g0 = pl.cast(g, pl.INT32) * SCORE_TOKEN_TILE
+        t0 = pl.cast(g0, pl.INDEX)
+        t1 = pl.cast(g0 + 1, pl.INDEX)
+        t2 = pl.cast(g0 + 2, pl.INDEX)
+        t3 = pl.cast(g0 + 3, pl.INDEX)
+        seg_a = pl.read(seg_start, [g0])
+        seg_b = pl.read(seg_start, [g0 + 1])
+        seg_c = pl.read(seg_start, [g0 + 2])
+        seg_d = pl.read(seg_start, [g0 + 3])
+        vis_a = pl.cast(pl.max(pl.read(pool_count, [g0]), 0), pl.INT32)
+        vis_b = pl.cast(pl.max(pl.read(pool_count, [g0 + 1]), 0), pl.INT32)
+        vis_c = pl.cast(pl.max(pl.read(pool_count, [g0 + 2]), 0), pl.INT32)
+        vis_d = pl.cast(pl.max(pl.read(pool_count, [g0 + 3]), 0), pl.INT32)
+        end_a = pl.add(seg_a, vis_a)
+        end_b = pl.add(seg_b, vis_b)
+        end_c = pl.add(seg_c, vis_c)
+        end_d = pl.add(seg_d, vis_d)
+        span_end = pl.cast(pl.max(pl.max(end_a, end_b), pl.max(end_c, end_d)), pl.INT32)
+        q_a = q_i8[t0 * INDEX_H : t0 * INDEX_H + INDEX_H, :]
+        q_b = q_i8[t1 * INDEX_H : t1 * INDEX_H + INDEX_H, :]
+        q_c = q_i8[t2 * INDEX_H : t2 * INDEX_H + INDEX_H, :]
+        q_d = q_i8[t3 * INDEX_H : t3 * INDEX_H + INDEX_H, :]
+        qs_a = pl.reshape(q_scale_dq[t0 * INDEX_H : t0 * INDEX_H + INDEX_H, :], [1, INDEX_H])
+        qs_b = pl.reshape(q_scale_dq[t1 * INDEX_H : t1 * INDEX_H + INDEX_H, :], [1, INDEX_H])
+        qs_c = pl.reshape(q_scale_dq[t2 * INDEX_H : t2 * INDEX_H + INDEX_H, :], [1, INDEX_H])
+        qs_d = pl.reshape(q_scale_dq[t3 * INDEX_H : t3 * INDEX_H + INDEX_H, :], [1, INDEX_H])
+        wt_a = head_weights[g0 : g0 + 1, 0:INDEX_H]
+        wt_b = head_weights[g0 + 1 : g0 + 2, 0:INDEX_H]
+        wt_c = head_weights[g0 + 2 : g0 + 3, 0:INDEX_H]
+        wt_d = head_weights[g0 + 3 : g0 + 4, 0:INDEX_H]
+        for c0 in pl.range(0, span_end, SCORE_KV_TILE):
+            c0_i = pl.cast(c0, pl.INT32)
+            c0_idx = pl.cast(c0_i, pl.INDEX)
+            kv_q_i8 = pool_i8[c0_idx : c0_idx + SCORE_KV_TILE, :]
+            kv_cache_scale_dq = pool_scale_col[c0_idx : c0_idx + SCORE_KV_TILE, :]
+            tile_hi = c0_i + SCORE_KV_TILE
+            lane = pl.arange(c0_i, [1, SCORE_KV_TILE], dtype=pl.INT32)
+            mask_ones = pl.full([1, SCORE_KV_TILE], dtype=pl.FP32, value=1.0)
+            mask_neg = pl.full([1, SCORE_KV_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+
+            lo = pl.cast(pl.max(seg_a, c0_i), pl.INT32)
+            hi = pl.cast(pl.min(end_a, tile_hi), pl.INT32)
+            if hi > lo:
+                dots_i32 = pl.matmul(kv_q_i8, q_a, out_dtype=pl.INT32, b_trans=True)
+                dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
+                dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
+                dots = pl.col_expand_mul(dots, qs_a)
+                dots = pl.mul(dots, SOFTMAX_SCALE)
+                relu = pl.maximum(dots, pl.mul(dots, 0.0))
+                weighted = pl.col_expand_mul(relu, wt_a)
+                row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
+                keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, lo), 1), 0), 1)
+                keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, hi)), 0), 1)
+                keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
+                masked = pl.add(pl.mul(row_score, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
+                index_scores[t0 : t0 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = masked
+
+            lo = pl.cast(pl.max(seg_b, c0_i), pl.INT32)
+            hi = pl.cast(pl.min(end_b, tile_hi), pl.INT32)
+            if hi > lo:
+                dots_i32 = pl.matmul(kv_q_i8, q_b, out_dtype=pl.INT32, b_trans=True)
+                dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
+                dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
+                dots = pl.col_expand_mul(dots, qs_b)
+                dots = pl.mul(dots, SOFTMAX_SCALE)
+                relu = pl.maximum(dots, pl.mul(dots, 0.0))
+                weighted = pl.col_expand_mul(relu, wt_b)
+                row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
+                keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, lo), 1), 0), 1)
+                keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, hi)), 0), 1)
+                keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
+                masked = pl.add(pl.mul(row_score, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
+                index_scores[t1 : t1 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = masked
+
+            lo = pl.cast(pl.max(seg_c, c0_i), pl.INT32)
+            hi = pl.cast(pl.min(end_c, tile_hi), pl.INT32)
+            if hi > lo:
+                dots_i32 = pl.matmul(kv_q_i8, q_c, out_dtype=pl.INT32, b_trans=True)
+                dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
+                dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
+                dots = pl.col_expand_mul(dots, qs_c)
+                dots = pl.mul(dots, SOFTMAX_SCALE)
+                relu = pl.maximum(dots, pl.mul(dots, 0.0))
+                weighted = pl.col_expand_mul(relu, wt_c)
+                row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
+                keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, lo), 1), 0), 1)
+                keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, hi)), 0), 1)
+                keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
+                masked = pl.add(pl.mul(row_score, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
+                index_scores[t2 : t2 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = masked
+
+            lo = pl.cast(pl.max(seg_d, c0_i), pl.INT32)
+            hi = pl.cast(pl.min(end_d, tile_hi), pl.INT32)
+            if hi > lo:
+                dots_i32 = pl.matmul(kv_q_i8, q_d, out_dtype=pl.INT32, b_trans=True)
+                dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
+                dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
+                dots = pl.col_expand_mul(dots, qs_d)
+                dots = pl.mul(dots, SOFTMAX_SCALE)
+                relu = pl.maximum(dots, pl.mul(dots, 0.0))
+                weighted = pl.col_expand_mul(relu, wt_d)
+                row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
+                keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, lo), 1), 0), 1)
+                keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, hi)), 0), 1)
+                keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
+                masked = pl.add(pl.mul(row_score, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
+                index_scores[t3 : t3 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = masked
+
+
+@pl.jit.inline
+def indexer_score_token(
+    index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
+    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
+    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
+    pool_rows: pl.Tensor[[POOLS_DYN], pl.INT32],
+    head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
+    seg_start: pl.Tensor[[T_DYN], pl.INT32],
+    pool_count: pl.Tensor[[T_DYN], pl.INT32],
+    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
+):
+    """Score every query row against its request's pooled keys, decode shape.
+
+    Identical numerics to :func:`indexer_score` on the shared prologue, but one
+    block per query: a decode dispatch carries only a handful of tokens per
+    request, and the prefill shape's ``SCORE_TOKEN_TILE`` groups would leave
+    most vector cores idle (a 16-token step makes four blocks). The donor keeps
+    the same split — its decode scorer is per-query too.
+    """
+    t_dim = pl.tensor.dim(index_q, 0)
+    q_i8, q_scale_dq, pool_i8, pool_scale_col = _indexer_score_prepare(
+        index_q, hadamard, pool_cache, pool_scale, pool_rows, index_scores
+    )
 
     for token in pl.spmd(t_dim, name_hint="indexer_score"):
         visible = pl.max(pl.read(pool_count, [token]), 0)
@@ -1309,6 +1478,7 @@ __all__ = [
     "indexer_proj_test",
     "indexer_score",
     "indexer_score_test",
+    "indexer_score_token",
     "indexer_topk",
     "indexer_topk_test",
     "sylvester_hadamard",
