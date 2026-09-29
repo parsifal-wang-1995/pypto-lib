@@ -831,17 +831,24 @@ def _pool_batch(tokens: int, counts: tuple[int, ...], positions: tuple[int, ...]
     return width, pool_table_rows, seg_start, pool_count, pool_rows
 
 
-def build_indexer_score_specs(tokens: int = 8):
+def build_indexer_score_specs(
+    tokens: int = 8,
+    counts: tuple[int, ...] | None = None,
+    positions: tuple[int, ...] | None = None,
+):
     """Build one deterministic two-request score batch.
 
     Request 0 owns 3000 pools so its longest query spans two sort leaves, and
     the query positions ramp from a first token (visible count 0) to a full
     window, so the causal clamp and the leaf-crossing window both execute.
+    ``counts``/``positions`` override the fixture geometry for the
+    business-shape benchmark points: one request whose positions are the
+    ``history`` ramp in front of the measured chunk.
     """
     from golden import TensorSpec
 
-    counts = (3000, 140)
-    positions = (2, 6, 5000, 11999, 3, 7, 500, 559)
+    counts = (3000, 140) if counts is None else counts
+    positions = (2, 6, 5000, 11999, 3, 7, 500, 559) if positions is None else positions
     width, pool_table_rows, seg_start, pool_count, pool_rows = _pool_batch(tokens, counts, positions)
 
     generator = torch.Generator().manual_seed(73)
@@ -867,20 +874,25 @@ def build_indexer_score_specs(tokens: int = 8):
     ]
 
 
-def build_indexer_topk_specs(tokens: int = 8):
+def build_indexer_topk_specs(
+    tokens: int = 8,
+    counts: tuple[int, ...] | None = None,
+    positions: tuple[int, ...] | None = None,
+):
     """Score-and-select on one batch: synthetic scores, real windows.
 
     The score rows are random values inside each query's window and
     ``FP32_NEG_INF`` outside it, which is exactly the shape :func:`indexer_score`
     leaves behind, so the sort sees realistic value structure without depending
-    on the scorer's numerics.
+    on the scorer's numerics. ``counts``/``positions`` override the fixture
+    geometry for the business-shape benchmark points.
     """
     from golden import TensorSpec
 
     from models.glm5_3_flash.config import FP32_NEG_INF as NEG_INF
 
-    counts = (3000, 140)
-    positions = (2, 6, 5000, 11999, 3, 7, 500, 559)
+    counts = (3000, 140) if counts is None else counts
+    positions = (2, 6, 5000, 11999, 3, 7, 500, 559) if positions is None else positions
     width, _, seg_start, pool_count, _ = _pool_batch(tokens, counts, positions)
 
     generator = torch.Generator().manual_seed(79)
@@ -902,16 +914,19 @@ def build_indexer_topk_specs(tokens: int = 8):
     ]
 
 
-def build_indexer_expand_specs(tokens: int = 8):
+def build_indexer_expand_specs(tokens: int = 8, lengths: tuple[int, ...] | None = None):
     """Expand selections across short rows, partial groups and a full row.
 
     The lengths ramp from a context too short to close one pool to one that
     fills all 512 selections, so the packing suffix, the tail window and the
-    full-prefix case all execute in one batch.
+    full-prefix case all execute in one batch. ``lengths`` overrides the ramp
+    for the business-shape benchmark points (one full-width row per token).
     """
     from golden import TensorSpec
 
-    lengths = (2, 3, 6, 15, 63, 1039, 2048, 2051)
+    lengths = (2, 3, 6, 15, 63, 1039, 2048, 2051) if lengths is None else lengths
+    if len(lengths) != tokens:
+        raise ValueError("lengths must cover every token")
     generator = torch.Generator().manual_seed(83)
 
     def init_selected_pools():
@@ -1077,7 +1092,46 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--case", default="all", choices=["proj", "score", "topk", "expand", "all"])
     parser.add_argument("--tokens", type=int, default=48)
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="run the case at a business shape without golden validation; the shape "
+        "comes from --tokens/--history, timing from PYPTO_BENCH=1",
+    )
+    parser.add_argument(
+        "--history",
+        type=int,
+        default=0,
+        help="history tokens in front of the --tokens chunk; defines the bench geometry",
+    )
     args = parser.parse_args()
+
+    def print_bench(label: str, result) -> None:
+        stats = result.bench
+        if stats is None:
+            print(f"[BENCH] {label}: no timing (run with PYPTO_BENCH=1)")
+            return
+        print(
+            f"[BENCH] {label}: device_us median={stats.device_us_median:.1f} "
+            f"min={stats.device_us_min:.1f} mean={stats.device_us_mean:.1f} "
+            f"max={stats.device_us_max:.1f} rounds={stats.rounds}"
+        )
+
+    def bench_label(name: str, pools: int = 0) -> str:
+        label = f"{name} T={args.tokens} history={args.history}"
+        if pools:
+            width = ((pools + 2 * LEAF - 2) // LEAF) * LEAF
+            label += f" pools={pools} width={width}"
+        return label
+
+    bench_counts = None
+    bench_positions = None
+    if args.bench:
+        pools = (args.tokens + args.history) // INDEX_KPOOL
+        bench_counts = (pools,)
+        bench_positions = tuple(range(args.history, args.history + args.tokens))
+        if args.tokens % 16:
+            parser.error("--bench needs a token count that is a multiple of 16")
 
     def selected_pools_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         scores = inputs["index_scores"].float()
@@ -1103,12 +1157,12 @@ def main():
 
     results = []
     if args.case in ("proj", "all"):
-        results.append(
-            run(
-                fn=indexer_proj_test,
-                specs=build_indexer_proj_specs(args.tokens),
+        if args.bench:
+            extra = dict(golden_fn=None)
+            label = bench_label("proj")
+        else:
+            extra = dict(
                 golden_fn=golden_indexer_proj_case,
-                config={"platform": args.platform, "device_id": args.device},
                 rtol=1.0 / 64,
                 atol=1e-3,
                 compare_fn={
@@ -1117,52 +1171,94 @@ def main():
                     "head_weights": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.01),
                     "gate_scores": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.01),
                 },
-                compile_only=args.compile_only,
             )
-        )
-    if args.case in ("score", "all"):
         results.append(
             run(
-                fn=indexer_score_test,
-                specs=build_indexer_score_specs(),
-                golden_fn=golden_indexer_score_case,
+                fn=indexer_proj_test,
+                specs=build_indexer_proj_specs(args.tokens),
                 config={"platform": args.platform, "device_id": args.device},
+                compile_only=args.compile_only,
+                **extra,
+            )
+        )
+        if args.bench:
+            print_bench(label, results[-1])
+    if args.case in ("score", "all"):
+        if args.bench:
+            specs = build_indexer_score_specs(args.tokens, bench_counts, bench_positions)
+            extra = dict(golden_fn=None)
+            label = bench_label("score", bench_counts[0])
+        else:
+            specs = build_indexer_score_specs()
+            extra = dict(
+                golden_fn=golden_indexer_score_case,
                 rtol=1.0 / 128,
                 atol=1e-4,
                 compare_fn={
                     "index_scores": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
                 },
-                compile_only=args.compile_only,
             )
-        )
-    if args.case in ("topk", "all"):
         results.append(
             run(
-                fn=indexer_topk_test,
-                specs=build_indexer_topk_specs(),
-                golden_fn=golden_indexer_topk_case,
+                fn=indexer_score_test,
+                specs=specs,
                 config={"platform": args.platform, "device_id": args.device},
+                compile_only=args.compile_only,
+                **extra,
+            )
+        )
+        if args.bench:
+            print_bench(label, results[-1])
+    if args.case in ("topk", "all"):
+        if args.bench:
+            specs = build_indexer_topk_specs(args.tokens, bench_counts, bench_positions)
+            extra = dict(golden_fn=None)
+            label = bench_label("topk", bench_counts[0])
+        else:
+            specs = build_indexer_topk_specs()
+            extra = dict(
+                golden_fn=golden_indexer_topk_case,
                 rtol=1e-3,
                 atol=1e-3,
                 compare_fn={
                     "selected_pools": selected_pools_compare,
                     "selected_valid": exact_compare,
                 },
+            )
+        results.append(
+            run(
+                fn=indexer_topk_test,
+                specs=specs,
+                config={"platform": args.platform, "device_id": args.device},
                 compile_only=args.compile_only,
+                **extra,
             )
         )
+        if args.bench:
+            print_bench(label, results[-1])
     if args.case in ("expand", "all"):
+        if args.bench:
+            specs = build_indexer_expand_specs(args.tokens, (args.tokens + args.history,) * args.tokens)
+            extra = dict(golden_fn=None)
+            label = bench_label("expand")
+        else:
+            specs = build_indexer_expand_specs()
+            extra = dict(
+                golden_fn=golden_indexer_expand_case,
+                rtol=0.0,
+                atol=0.0,
+            )
         results.append(
             run(
                 fn=indexer_expand_test,
-                specs=build_indexer_expand_specs(),
-                golden_fn=golden_indexer_expand_case,
+                specs=specs,
                 config={"platform": args.platform, "device_id": args.device},
-                rtol=0.0,
-                atol=0.0,
                 compile_only=args.compile_only,
+                **extra,
             )
         )
+        if args.bench:
+            print_bench(label, results[-1])
     for result in results:
         print(result)
         if not result.passed:

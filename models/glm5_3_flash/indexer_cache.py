@@ -452,7 +452,23 @@ def main():
     parser.add_argument("--events", type=int, default=6)
     parser.add_argument("--raw-pages", type=int, default=2)
     parser.add_argument("--pool-pages", type=int, default=8)
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="skip golden validation; shapes come from --tokens/--pages/--events, timing from PYPTO_BENCH=1",
+    )
     args = parser.parse_args()
+
+    def print_bench(label: str, result) -> None:
+        stats = result.bench
+        if stats is None:
+            print(f"[BENCH] {label}: no timing (run with PYPTO_BENCH=1)")
+            return
+        print(
+            f"[BENCH] {label}: device_us median={stats.device_us_median:.1f} "
+            f"min={stats.device_us_min:.1f} mean={stats.device_us_mean:.1f} "
+            f"max={stats.device_us_max:.1f} rounds={stats.rounds}"
+        )
 
     results = []
     if args.case in ("write", "both"):
@@ -460,28 +476,37 @@ def main():
             run(
                 fn=indexer_cache_write_test,
                 specs=build_indexer_cache_write_specs(args.tokens, args.pages),
-                golden_fn=golden_indexer_cache_write_case,
+                golden_fn=None if args.bench else golden_indexer_cache_write_case,
                 config={"platform": args.platform, "device_id": args.device},
                 rtol=0.0,
                 atol=0.0,
                 compile_only=args.compile_only,
             )
         )
+        if args.bench:
+            print_bench(f"cache_write tokens={args.tokens} pages={args.pages}", results[-1])
     if args.case in ("pool", "both"):
         results.append(
             run(
                 fn=indexer_pool_write_test,
                 specs=build_indexer_pool_write_specs(args.events, args.raw_pages, args.pool_pages),
-                golden_fn=golden_indexer_pool_write_case,
+                golden_fn=None if args.bench else golden_indexer_pool_write_case,
                 config={"platform": args.platform, "device_id": args.device},
                 rtol=1.0 / 64,
                 atol=1e-3,
-                compare_fn={
+                compare_fn=None
+                if args.bench
+                else {
                     "pool_cache": ratio_allclose(atol=1e-3, rtol=1.0 / 64, max_error_ratio=0.01),
                 },
                 compile_only=args.compile_only,
             )
         )
+        if args.bench:
+            print_bench(
+                f"pool_write events={args.events} raw_pages={args.raw_pages} pool_pages={args.pool_pages}",
+                results[-1],
+            )
     for result in results:
         print(result)
         if not result.passed:

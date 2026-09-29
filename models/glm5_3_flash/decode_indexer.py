@@ -165,14 +165,16 @@ def decode_indexer_step_test(
     )
 
 
-def build_decode_indexer_step_specs(requests: int = 4):
+def build_decode_indexer_step_specs(requests: int = 4, prior_counts: int | tuple[int, ...] | None = None):
     """Build one deterministic decode step: four requests, one closing pool each.
 
     The requests carry prior contexts of different lengths, so one closing pool
     is made of four fresh rows, another of fresh rows mixed with rows cached by
     earlier steps, and the pooled table starts with rows only earlier steps
     could have written. Every request contributes exactly
-    ``DECODE_ROWS_PER_REQUEST`` query rows.
+    ``DECODE_ROWS_PER_REQUEST`` query rows. ``prior_counts`` overrides the
+    fixture's per-request pool history for the business-shape benchmark points;
+    an int means the same history for every request.
     """
     from golden import TensorSpec
 
@@ -182,7 +184,12 @@ def build_decode_indexer_step_specs(requests: int = 4):
     tokens = requests * rows_per_request
     if tokens % 16:
         raise ValueError("the projection stage needs a token count that is a multiple of 16")
-    prior_counts = (13, 5, 40, 2)[:requests]
+    if prior_counts is None:
+        prior_counts = (13, 5, 40, 2)[:requests]
+    elif isinstance(prior_counts, int):
+        prior_counts = (prior_counts,) * requests
+    if len(prior_counts) != requests:
+        raise ValueError("prior_counts must hold one pool count per request")
     new_counts = tuple(count + 1 for count in prior_counts)
     pools_true = sum(new_counts)
     width = ((pools_true + 2 * LEAF - 2) // LEAF) * LEAF
@@ -193,13 +200,13 @@ def build_decode_indexer_step_specs(requests: int = 4):
     def row_map():
         """Physical raw row of every request's logical token, past and new."""
         rows = {}
-        used = 0
+        max_total = max(prior_tokens) + rows_per_request
+        page_pool = max(8, (max_total + 127) // 128 + 4)
         for request in range(requests):
             total = prior_tokens[request] + rows_per_request
-            pages = torch.randperm(8, generator=generator)[: (total + 127) // 128 + 1]
+            pages = torch.randperm(page_pool, generator=generator)[: (total + 127) // 128 + 1]
             for position in range(total):
                 rows[(request, position)] = int(pages[position // 128]) * 128 + position % 128
-            used += 1
         return rows
 
     mapping = row_map()
@@ -422,7 +429,53 @@ def main():
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--requests", type=int, default=4)
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="run the step at a business shape without golden validation; the shape "
+        "comes from --requests/--prior-tokens, timing from PYPTO_BENCH=1",
+    )
+    parser.add_argument(
+        "--prior-tokens",
+        type=int,
+        default=8192,
+        help="per-request history length in tokens; defines the bench geometry",
+    )
     args = parser.parse_args()
+
+    def print_bench(label: str, result) -> None:
+        stats = result.bench
+        if stats is None:
+            print(f"[BENCH] {label}: no timing (run with PYPTO_BENCH=1)")
+            return
+        print(
+            f"[BENCH] {label}: device_us median={stats.device_us_median:.1f} "
+            f"min={stats.device_us_min:.1f} mean={stats.device_us_mean:.1f} "
+            f"max={stats.device_us_max:.1f} rounds={stats.rounds}"
+        )
+
+    if args.bench:
+        if args.requests % 4:
+            parser.error("--bench needs a multiple of 4 requests (projection tile multiple of 16)")
+        prior_pools = args.prior_tokens // INDEX_KPOOL
+        specs = build_decode_indexer_step_specs(args.requests, prior_pools)
+        pools_true = args.requests * (prior_pools + 1)
+        width = ((pools_true + 2 * LEAF - 2) // LEAF) * LEAF
+        label = (
+            f"decode_step requests={args.requests} prior_tokens={args.prior_tokens} "
+            f"T={args.requests * 4} pools={pools_true} width={width}"
+        )
+        result = run(
+            fn=decode_indexer_step_test,
+            specs=specs,
+            golden_fn=None,
+            config={"platform": args.platform, "device_id": args.device},
+            compile_only=args.compile_only,
+        )
+        print_bench(label, result)
+        if not result.passed:
+            raise SystemExit(result.error or 1)
+        return
 
     def selected_pools_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         scores = actual_outputs["index_scores"].float()
