@@ -32,8 +32,11 @@ scorer reads that table directly. What remains here is the per-query half:
    scores only its own request's pools: ``seg_start`` locates the request's
    segment in the compacted pool id space and ``pool_count`` is the causally
    visible pool count, ``(position + 1) // index_kpool`` clamped to the
-   request's pool count. Everything outside ``[seg_start, seg_start +
-   pool_count)`` stays at the finite ``FP32_NEG_INF``.
+   request's pool count. Lanes outside a query's visible window are
+   **undefined scratch**: prefill group tiles store their whole 128-lane span
+   and no init or post-mask pass cleans the rest, so only :func:`indexer_topk`
+   — whose leaf loads clamp through their valid shape and ``PadValue.min``
+   fill — may read this matrix.
 3. **Selection.** Exact top ``index_topk / index_kpool`` = 512 pools per query
    over the same 262144-candidate cap as the donor, with a ``selected_valid``
    output so the expansion can tell padding from a real pick. Selections are
@@ -123,14 +126,10 @@ SCORE_C_TILE = 64
 # whole group. The token count must be a multiple of SCORE_TOKEN_TILE.
 SCORE_TOKEN_TILE = 4
 SCORE_KV_TILE = 128
-# Width of the post-loop window-mask chunks; the score width always carries at
-# least one LEAF of slack, so full chunks never run past the tensor.
-SCORE_MASK_COLS = 2048
 # The pooled table is addressed in POOL_GATHER_BLOCK-row blocks: the host maps each
 # compacted block to one contiguous physical base row, so the gather moves whole
 # blocks instead of single scattered rows.
 POOL_GATHER_BLOCK = 64
-SCORE_INIT_COLS = 1024
 EXPAND_W_TILE = 256
 EXPAND_TAIL_CHUNK = 8  # covers the last lanes in one aligned tile
 # pl.const accepts literals only; assert keeps the hard-coded start honest.
@@ -321,13 +320,13 @@ def _indexer_score_prepare(
     pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
     pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
     pool_blocks: pl.Tensor[[POOLS_DYN], pl.INT32],
-    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
 ):
-    """Shared scorer prologue: query rotation/quant, pool gather and init.
+    """Shared scorer prologue: query rotation/quant and the pool gather.
 
     Returns the INT8 query rows with their dequant scales and the contiguous
-    INT8/scale scratch the score loops read, with the score matrix pre-filled
-    at the finite negative sentinel.
+    INT8/scale scratch the score loops read. The score matrix itself needs no
+    preparation: prefill tiles store their whole lane span and the top-k clamps
+    through its valid-shaped leaf loads, so there is no init fill.
     """
     t_dim = pl.tensor.dim(index_q, 0)
     pools = pl.tensor.dim(pool_blocks, 0) * POOL_GATHER_BLOCK
@@ -381,12 +380,6 @@ def _indexer_score_prepare(
         sc8 = pool_scale_g[c0_idx : c0_idx + SCORE_C_TILE, :]
         summed = pl.reshape(pl.row_sum(sc8), [SCORE_C_TILE, 1])
         pool_scale_col[c0_idx : c0_idx + SCORE_C_TILE, :] = pl.mul(summed, 0.125 * SOFTMAX_SCALE)
-
-    for token in pl.spmd(t_dim, name_hint="indexer_score_init"):
-        for c0 in pl.range(0, pools, SCORE_INIT_COLS):
-            index_scores[token : token + 1, c0 : c0 + SCORE_INIT_COLS] = pl.full(
-                [1, SCORE_INIT_COLS], dtype=pl.FP32, value=FP32_NEG_INF
-            )
     return q_i8, q_scale_dq, pool_i8, pool_scale_col
 
 
@@ -411,13 +404,15 @@ def indexer_score(
     (donor C8 shape). The score matrix width must be a multiple of
     :data:`LEAF` with at least one leaf of slack beyond the last request's
     window, so the scorer's stores and the top-k's leaf loads never address
-    past the tensor. Every lane outside a query's visible window stays at
-    ``FP32_NEG_INF``. The token count must be a multiple of
-    :data:`SCORE_TOKEN_TILE`.
+    past the tensor. Lanes outside a query's visible window are **undefined**:
+    a group's tiles store their whole 128-lane span and nothing cleans the
+    rest, so the only legal reader is :func:`indexer_topk`, whose leaf loads
+    clamp to the visible tail through their valid shape. The token count must
+    be a multiple of :data:`SCORE_TOKEN_TILE`.
     """
     t_dim = pl.tensor.dim(index_q, 0)
     q_i8, q_scale_dq, pool_i8, pool_scale_col = _indexer_score_prepare(
-        index_q, hadamard, pool_cache, pool_scale, pool_blocks, index_scores
+        index_q, hadamard, pool_cache, pool_scale, pool_blocks
     )
 
     # Donor CP shape: one block owns SCORE_TOKEN_TILE consecutive queries and
@@ -428,10 +423,8 @@ def indexer_score(
     # query multiplier (scale times head weight), the head row_sum — because
     # per-tile vector ops dominate this loop (E8 anchors: the mmads alone run
     # 15x faster than the full score). Overlap tiles store their whole lane
-    # span unmasked; a post-loop chunked pass re-applies each query's window
-    # once per 2048 lanes instead of once per 128-lane tile. Lanes the pass
-    # covers but no tile wrote (or tiles before a request's segment) already
-    # hold the init sentinel, and the read-modify-write is idempotent there.
+    # span; lanes outside a query's window stay undefined for the top-k's
+    # valid-shaped leaf loads to clamp (no init fill, no post-mask pass).
     for g in pl.spmd(t_dim // SCORE_TOKEN_TILE, name_hint="indexer_score"):
         g0 = pl.cast(g, pl.INT32) * SCORE_TOKEN_TILE
         t0 = pl.cast(g0, pl.INDEX)
@@ -465,8 +458,6 @@ def indexer_score(
         qsw_b = pl.mul(qs_b, head_weights[g0 + 1 : g0 + 2, 0:INDEX_H])
         qsw_c = pl.mul(qs_c, head_weights[g0 + 2 : g0 + 3, 0:INDEX_H])
         qsw_d = pl.mul(qs_d, head_weights[g0 + 3 : g0 + 4, 0:INDEX_H])
-        mask_ones = pl.full([1, SCORE_MASK_COLS], dtype=pl.FP32, value=1.0)
-        mask_neg = pl.full([1, SCORE_MASK_COLS], dtype=pl.FP32, value=FP32_NEG_INF)
         for c0 in pl.range(0, span_end, SCORE_KV_TILE):
             c0_i = pl.cast(c0, pl.INT32)
             c0_idx = pl.cast(c0_i, pl.INDEX)
@@ -518,41 +509,6 @@ def indexer_score(
                 row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
                 index_scores[t3 : t3 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = row_score
 
-        # Post-loop window mask, one chunked pass per group instead of a mask
-        # chain per (token, tile). Full chunks stay inside the tensor because
-        # the width carries at least one LEAF of slack beyond every span.
-        for m0 in pl.range(0, span_end, SCORE_MASK_COLS):
-            m0_i = pl.cast(m0, pl.INT32)
-            m0_idx = pl.cast(m0_i, pl.INDEX)
-            lane = pl.arange(m0_i, [1, SCORE_MASK_COLS], dtype=pl.INT32)
-            keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, seg_a), 1), 0), 1)
-            keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, end_a)), 0), 1)
-            keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
-            row = index_scores[t0 : t0 + 1, m0_idx : m0_idx + SCORE_MASK_COLS]
-            fixed = pl.add(pl.mul(row, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
-            index_scores[t0 : t0 + 1, m0_idx : m0_idx + SCORE_MASK_COLS] = fixed
-
-            keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, seg_b), 1), 0), 1)
-            keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, end_b)), 0), 1)
-            keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
-            row = index_scores[t1 : t1 + 1, m0_idx : m0_idx + SCORE_MASK_COLS]
-            fixed = pl.add(pl.mul(row, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
-            index_scores[t1 : t1 + 1, m0_idx : m0_idx + SCORE_MASK_COLS] = fixed
-
-            keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, seg_c), 1), 0), 1)
-            keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, end_c)), 0), 1)
-            keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
-            row = index_scores[t2 : t2 + 1, m0_idx : m0_idx + SCORE_MASK_COLS]
-            fixed = pl.add(pl.mul(row, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
-            index_scores[t2 : t2 + 1, m0_idx : m0_idx + SCORE_MASK_COLS] = fixed
-
-            keep_lo = pl.minimum(pl.maximum(pl.add(pl.sub(lane, seg_d), 1), 0), 1)
-            keep_hi = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, end_d)), 0), 1)
-            keep = pl.cast(pl.mul(keep_lo, keep_hi), pl.FP32)
-            row = index_scores[t3 : t3 + 1, m0_idx : m0_idx + SCORE_MASK_COLS]
-            fixed = pl.add(pl.mul(row, keep), pl.mul(mask_neg, pl.sub(mask_ones, keep)))
-            index_scores[t3 : t3 + 1, m0_idx : m0_idx + SCORE_MASK_COLS] = fixed
-
 
 @pl.jit.inline
 def indexer_score_token(
@@ -576,7 +532,7 @@ def indexer_score_token(
     """
     t_dim = pl.tensor.dim(index_q, 0)
     q_i8, q_scale_dq, pool_i8, pool_scale_col = _indexer_score_prepare(
-        index_q, hadamard, pool_cache, pool_scale, pool_blocks, index_scores
+        index_q, hadamard, pool_cache, pool_scale, pool_blocks
     )
 
     for token in pl.spmd(t_dim, name_hint="indexer_score"):
@@ -1310,6 +1266,25 @@ def main():
 
     from golden import ratio_allclose, run, topk_pair_compare
 
+    def score_window_compare(actual, expected, *, inputs, rtol, atol, **_kwargs):
+        """Compare only each query's visible window: the kernel leaves every
+        other lane as undefined scratch (the top-k clamps through its valid
+        shapes), so out-of-window contents carry no contract to check."""
+
+        seg = inputs["seg_start"].long().unsqueeze(1)
+        end = seg + inputs["pool_count"].long().clamp(min=0).unsqueeze(1)
+        lanes = torch.arange(actual.shape[-1]).unsqueeze(0)
+        window = (lanes >= seg) & (lanes < end)
+        picked_a = actual.float()[window]
+        picked_e = expected.float()[window]
+        if picked_a.numel() == 0:
+            return True, ""
+        bad = ~torch.isfinite(picked_a)
+        bad |= (picked_a - picked_e).abs() > (atol + rtol * picked_e.abs())
+        ratio = bad.float().mean().item()
+        ok = ratio <= 0.01
+        return ok, "" if ok else f"    in-window mismatch ratio {ratio:.4f}"
+
     _self_check()
 
     parser = argparse.ArgumentParser()
@@ -1421,7 +1396,7 @@ def main():
                 rtol=1.0 / 128,
                 atol=1e-4,
                 compare_fn={
-                    "index_scores": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+                    "index_scores": score_window_compare,
                 },
             )
         results.append(

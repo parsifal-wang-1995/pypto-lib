@@ -524,6 +524,25 @@ def main():
         exact = torch.equal(actual.cpu(), expected.cpu())
         return exact, "" if exact else "    integer output differs from golden"
 
+    def score_window_compare(actual, expected, *, inputs, rtol, atol, **_kwargs):
+        """Compare only each query's visible window: lanes outside it are
+        undefined scratch under the scorer's contract (the top-k clamps
+        through its valid shapes), so they carry nothing to check."""
+
+        seg = inputs["seg_start"].long().unsqueeze(1)
+        end = seg + inputs["pool_count"].long().clamp(min=0).unsqueeze(1)
+        lanes = torch.arange(actual.shape[-1]).unsqueeze(0)
+        window = (lanes >= seg) & (lanes < end)
+        picked_a = actual.float()[window]
+        picked_e = expected.float()[window]
+        if picked_a.numel() == 0:
+            return True, ""
+        bad = ~torch.isfinite(picked_a)
+        bad |= (picked_a - picked_e).abs() > (atol + rtol * picked_e.abs())
+        ratio = bad.float().mean().item()
+        ok = ratio <= 0.01
+        return ok, "" if ok else f"    in-window mismatch ratio {ratio:.4f}"
+
     def topk_indices_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         """Tie-aware position compare for the expanded front-packed rows.
 
@@ -586,7 +605,7 @@ def main():
             "pool_cache": ratio_allclose(atol=1.0, rtol=0.0, max_error_ratio=0.005),
             "pool_scale": ratio_allclose(atol=1e-6, rtol=1e-3, max_error_ratio=0.005),
             "pool_valid": exact_compare,
-            "index_scores": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+            "index_scores": score_window_compare,
             "selected_pools": selected_pools_compare,
             "selected_valid": exact_compare,
             "topk_indices": topk_indices_compare,
