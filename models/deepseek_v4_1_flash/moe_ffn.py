@@ -68,7 +68,13 @@ T = BATCH * S1
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
-E = M.n_routed_experts
+# Routed experts resident on THIS card. The full table is 384 (single-card
+# validation); the 32-card high-throughput deployment (GBS=384 -> 12
+# requests/card x 6 DSpark verify rows = T=72) shards it EP32 -> 12
+# experts/card. Dispatch then delivers only this card's rows; balanced
+# routing gives the same 432 rows at T=72, so E=12 T=72 reproduces the
+# EP32 per-card compute core. Import-time knob: --experts.
+E = _parse_cli_int("experts", M.n_routed_experts)
 TOPK = M.num_experts_per_tok
 
 T_PAD = ((T + 15) // 16) * 16
@@ -1057,6 +1063,9 @@ def validate(argv=None):
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--batch", type=int, default=None,
                         help="requests per card (s1=6 rows each); import-time knob")
+    parser.add_argument("--experts", type=int, default=None,
+                        help="routed experts resident on this card "
+                        "(384=single-card, 12=EP32 per-card form); import-time knob")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
