@@ -101,14 +101,11 @@ MX_W2_PACKED_TILES = 2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)
 MX_W1_PACKED_ROWS = MX_W1_PACKED_TILES * MX_PACKED_LANE_ROWS
 MX_W3_PACKED_ROWS = MX_W3_PACKED_TILES * MX_PACKED_LANE_ROWS
 MX_W2_PACKED_ROWS = MX_W2_PACKED_TILES * MX_PACKED_LANE_ROWS
-ROUTE_D_OUT_TILE = 512
-ROUTE_TASK_TILE = D
 assert MOE_INTER % MX_MM_TASK_TILE == 0
 assert D % MX_K_TILE == 0
 assert MX_MM_TASK_TILE % MX_MM_INTER_TILE == 0
 assert D % MX_W2_TASK_TILE == 0
 assert MX_W2_TASK_TILE % MX_W2_D_OUT_TILE == 0
-assert ROUTE_TASK_TILE % ROUTE_D_OUT_TILE == 0
 
 # input activation requant tiling (mirrors gate.py)
 XQ_TILE = 256
@@ -208,9 +205,10 @@ def moe_ffn_compute(
         expert_completion_tids = pl.array.create(E, pl.TASK_ID)
 
         # ------------------------------------------------------------------
-        # Stages 1-7, fused per expert: W1/W3/W2 in-kernel FP4->FP8 dequant
-        # once per expert, then per 64-row chunk: gather + requant, GMM1,
-        # SwiGLU + requant, GMM2, round + scatter into y_buf.
+        # Stages 1-6, fused per expert: W1/W3/W2 in-kernel FP4->FP8 dequant
+        # once per expert, then per 64-row chunk: gather + requant, GMM1
+        # (fix-pipe drains BF16), SwiGLU + requant, GMM2 (fix-pipe BF16),
+        # scatter into y_buf.
         # ------------------------------------------------------------------
         for local_e in pl.parallel(E):
             tile_completion_tids = pl.array.create(MAX_TILES_PER_EXPERT, pl.TASK_ID)
@@ -507,11 +505,14 @@ def moe_ffn_compute(
                                                 x_stage_scale_backing,
                                             )
 
-                                    gate_tile_fp32 = pl.create_tensor(
-                                        [RECV_TILE, MOE_INTER], dtype=pl.FP32,
+                                    # GMM1 drains through the fix-pipe straight
+                                    # to BF16: exactly the pre-SwiGLU rint CANN
+                                    # applies, with no FP32 GM round-trip.
+                                    gate_tile_bf16 = pl.create_tensor(
+                                        [RECV_TILE, MOE_INTER], dtype=pl.BF16,
                                     )
-                                    up_tile_fp32 = pl.create_tensor(
-                                        [RECV_TILE, MOE_INTER], dtype=pl.FP32,
+                                    up_tile_bf16 = pl.create_tensor(
+                                        [RECV_TILE, MOE_INTER], dtype=pl.BF16,
                                     )
 
                                     with pl.spmd(
@@ -561,8 +562,8 @@ def moe_ffn_compute(
                                                         gate_acc, xs_k, xs_scale_k,
                                                         w1_tile, w1_scale_k,
                                                     )
-                                            gate_tile_fp32 = pl.store(
-                                                gate_acc, [0, n0], gate_tile_fp32,
+                                            gate_tile_bf16 = pl.store(
+                                                gate_acc, [0, n0], gate_tile_bf16,
                                             )
 
                                     with pl.spmd(
@@ -612,8 +613,8 @@ def moe_ffn_compute(
                                                         up_acc, xs_k, xs_scale_k,
                                                         w3_tile, w3_scale_k,
                                                     )
-                                            up_tile_fp32 = pl.store(
-                                                up_acc, [0, n0], up_tile_fp32,
+                                            up_tile_bf16 = pl.store(
+                                                up_acc, [0, n0], up_tile_bf16,
                                             )
 
                                     h_tile_mx = h_mx[t0 : t0 + RECV_TILE]
@@ -638,22 +639,22 @@ def moe_ffn_compute(
                                         for ag in pl.pipeline(ACT_GATE_INNER, stage=2):
                                             a0 = a_base + ag * ACT_INTER_TILE
                                             h_a0 = ag * ACT_INTER_TILE
-                                            gate_2d = pl.load(
-                                                gate_tile_fp32, [0, a0],
-                                                [RECV_TILE, ACT_INTER_TILE],
-                                            )
-                                            up_2d = pl.load(
-                                                up_tile_fp32, [0, a0],
-                                                [RECV_TILE, ACT_INTER_TILE],
-                                            )
-                                            # CANN rounds W1/W3 to BF16 before
-                                            # SwiGLU.
+                                            # The fix-pipe already rounded
+                                            # gate/up to BF16 on drain (CANN's
+                                            # pre-SwiGLU rint); widen to FP32
+                                            # for the activation math.
                                             gate_2d = pl.cast(
-                                                pl.cast(gate_2d, pl.BF16, mode="rint"),
+                                                pl.load(
+                                                    gate_tile_bf16, [0, a0],
+                                                    [RECV_TILE, ACT_INTER_TILE],
+                                                ),
                                                 pl.FP32,
                                             )
                                             up_2d = pl.cast(
-                                                pl.cast(up_2d, pl.BF16, mode="rint"),
+                                                pl.load(
+                                                    up_tile_bf16, [0, a0],
+                                                    [RECV_TILE, ACT_INTER_TILE],
+                                                ),
                                                 pl.FP32,
                                             )
                                             if SWIGLU_LIMIT > 0.0:
@@ -774,9 +775,9 @@ def moe_ffn_compute(
                                     layout=pl.MX_A_ZZ,
                                 )
                                 with pl.scope():
-                                    recv_y_tile_fp32 = pl.create_tensor(
-                                        [RECV_TILE, D], dtype=pl.FP32,
-                                    )
+                                    # GMM2 drains through the fix-pipe straight
+                                    # to BF16 (the golden rint): no FP32 GM
+                                    # round-trip, no separate round task.
                                     recv_y_tile = pl.create_tensor(
                                         [RECV_TILE, D], dtype=pl.BF16,
                                     )
@@ -827,43 +828,14 @@ def moe_ffn_compute(
                                                         y_acc, h_k, h_scale_k,
                                                         w2_tile, w2_scale_k,
                                                     )
-                                            recv_y_tile_fp32 = pl.store(
-                                                y_acc, [0, d0], recv_y_tile_fp32,
+                                            recv_y_tile = pl.store(
+                                                y_acc, [0, d0], recv_y_tile,
                                             )
 
-                                    with pl.spmd(
-                                        D // ROUTE_TASK_TILE,
-                                        name_hint="ffn_output_round",
-                                        deps=[w2_mxfp4_aic_tid],
-                                    ) as output_round_tid:
-                                        wb_idx = pl.tile.get_block_idx()
-                                        d_base = wb_idx * ROUTE_TASK_TILE
-                                        for dg in pl.range(
-                                            ROUTE_TASK_TILE // ROUTE_D_OUT_TILE
-                                        ):
-                                            d0 = d_base + dg * ROUTE_D_OUT_TILE
-                                            y_fp32 = pl.load(
-                                                recv_y_tile_fp32, [0, d0],
-                                                [RECV_TILE, ROUTE_D_OUT_TILE],
-                                            )
-                                            y_valid = pl.set_validshape(
-                                                y_fp32, valid_rows, ROUTE_D_OUT_TILE,
-                                            )
-                                            y_padded = pl.fillpad(
-                                                y_valid, pad_value=pl.PadValue.zero,
-                                            )
-                                            recv_y_tile = pl.store(
-                                                pl.cast(
-                                                    y_padded, target_type=pl.BF16,
-                                                    mode="rint",
-                                                ),
-                                                [0, d0],
-                                                recv_y_tile,
-                                            )
                                     with pl.at(
                                         level=pl.Level.CORE_GROUP,
                                         name_hint="ffn_row_scatter",
-                                        deps=[output_round_tid],
+                                        deps=[w2_mxfp4_aic_tid],
                                     ) as scatter_tid:
                                         for r in pl.range(0, valid_rows):
                                             j = pl.cast(
