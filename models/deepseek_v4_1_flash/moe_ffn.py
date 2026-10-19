@@ -136,8 +136,11 @@ assert MOE_INTER % QUANT_TILE == 0
 SWIGLU_GROUPS = QUANT_TILE // MX_GROUP
 SWIGLU_SCALE_TMP = ((64 + (AIV_ROW_TILE // 16) * SWIGLU_GROUPS + 31) // 32) * 32
 
-# top-k aggregation tiling
-RED_TILE = 512
+# top-k aggregation tiling: one AIV block per token. RED_TILE=512 spawned
+# 720 tiny blocks whose ~0.53us/block serialized AICPU completion handling
+# made moe_ffn_reduce a 380us tail (21% of the E=12 window); 72 blocks
+# keep the whole aggregation off the critical path.
+RED_TILE = 5120
 assert D % RED_TILE == 0
 
 IDX_PAD = 8
