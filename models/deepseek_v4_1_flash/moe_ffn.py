@@ -429,9 +429,9 @@ def moe_ffn_compute(
                                         deps=[group_tid],
                                     ) as xquant_tid:
                                         blk = pl.tile.get_block_idx()
+                                        n_sub = (valid_rows + AIV_ROW_TILE - 1) // AIV_ROW_TILE
                                         for rq in pl.range(
-                                            (RECV_TILE // AIV_ROW_TILE)
-                                            * (XQ_TASK_TILE // XQ_TILE)
+                                            n_sub * (XQ_TASK_TILE // XQ_TILE)
                                         ):
                                             rb = (
                                                 rq // (XQ_TASK_TILE // XQ_TILE)
@@ -653,7 +653,8 @@ def moe_ffn_compute(
                                     ) as gate_up_act_quant_tid:
                                         ab_idx = pl.tile.get_block_idx()
                                         a_base = ab_idx * QUANT_TILE
-                                        for rs in pl.range(RECV_TILE // AIV_ROW_TILE):
+                                        n_sub = (valid_rows + AIV_ROW_TILE - 1) // AIV_ROW_TILE
+                                        for rs in pl.range(n_sub):
                                             rb = rs * AIV_ROW_TILE
                                             h_fp32 = pl.tile.full(
                                                 [AIV_ROW_TILE, QUANT_TILE], dtype=pl.FP32,
