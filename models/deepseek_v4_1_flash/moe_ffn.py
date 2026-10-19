@@ -84,12 +84,20 @@ TOTAL = T * TOPK
 # its own pl.scope so the ring heap recycles it. Staging offsets stay
 # window-relative (0 .. CHUNK_ROWS), which keeps every MX_A_ZZ scale view
 # provably 16-aligned without a dynamic per-expert base.
+#
+# RECV_TILE=64: one xgather/GMM1/act/GMM2/scatter instance serves the whole
+# 64-row chunk. The GMM instances are weight-load bound, so a 16-row tile
+# re-read the expert's full weights once per tile (3x at 36 rows/expert)
+# and tripled the AICPU submit count; one instance per chunk reads them
+# once. The AIV quant kernels still process the window in AIV_ROW_TILE-row
+# sub-tiles to bound UB; every MX_A_ZZ scale atom stays 16-row aligned.
+RECV_TILE = 64
+AIV_ROW_TILE = 16
 CHUNK_ROWS = 64
-CHUNK_TILES = CHUNK_ROWS // 16
-MAX_TILES_PER_EXPERT = (TOTAL + 15) // 16
+CHUNK_TILES = (CHUNK_ROWS + RECV_TILE - 1) // RECV_TILE
+MAX_TILES_PER_EXPERT = (TOTAL + RECV_TILE - 1) // RECV_TILE
 
 # tiling (mirrors expert_routed.py so the packed weight ABI is identical)
-RECV_TILE = 16
 MX_GROUP = 32
 K_SCALE = D // MX_GROUP
 H_SCALE = MOE_INTER // MX_GROUP
@@ -117,7 +125,7 @@ assert MX_W2_TASK_TILE % MX_W2_D_OUT_TILE == 0
 XQ_TILE = 256
 XQ_TASK_TILE = XQ_TILE * 4
 XQ_GROUPS = XQ_TILE // MX_GROUP
-XQ_SCALE_TMP = ((64 + (RECV_TILE // 16) * XQ_GROUPS + 31) // 32) * 32
+XQ_SCALE_TMP = ((64 + (AIV_ROW_TILE // 16) * XQ_GROUPS + 31) // 32) * 32
 assert D % XQ_TASK_TILE == 0
 
 # SwiGLU requant tiling (mirrors expert_routed.py)
@@ -126,7 +134,7 @@ QUANT_TILE = 768
 ACT_GATE_INNER = QUANT_TILE // ACT_INTER_TILE
 assert MOE_INTER % QUANT_TILE == 0
 SWIGLU_GROUPS = QUANT_TILE // MX_GROUP
-SWIGLU_SCALE_TMP = ((64 + (RECV_TILE // 16) * SWIGLU_GROUPS + 31) // 32) * 32
+SWIGLU_SCALE_TMP = ((64 + (AIV_ROW_TILE // 16) * SWIGLU_GROUPS + 31) // 32) * 32
 
 # top-k aggregation tiling
 RED_TILE = 512
@@ -418,19 +426,27 @@ def moe_ffn_compute(
                                         deps=[group_tid],
                                     ) as xquant_tid:
                                         blk = pl.tile.get_block_idx()
-                                        for qc in pl.range(XQ_TASK_TILE // XQ_TILE):
+                                        for rq in pl.range(
+                                            (RECV_TILE // AIV_ROW_TILE)
+                                            * (XQ_TASK_TILE // XQ_TILE)
+                                        ):
+                                            rb = (
+                                                rq // (XQ_TASK_TILE // XQ_TILE)
+                                            ) * AIV_ROW_TILE
+                                            qc = rq % (XQ_TASK_TILE // XQ_TILE)
                                             k0 = blk * XQ_TASK_TILE + qc * XQ_TILE
                                             xq_bf16 = pl.tile.full(
-                                                [RECV_TILE, XQ_TILE], dtype=pl.BF16,
+                                                [AIV_ROW_TILE, XQ_TILE], dtype=pl.BF16,
                                                 value=0.0,
                                             )
-                                            for r in pl.range(RECV_TILE):
-                                                # Reads may spill RECV_TILE rows
-                                                # past TOTAL into the zero-filled
-                                                # slack (token 0 rows; only
+                                            for r in pl.range(AIV_ROW_TILE):
+                                                # Reads may spill past TOTAL
+                                                # into the zero-filled slack
+                                                # (token 0 rows; only
                                                 # valid_rows are consumed later).
                                                 ar = pl.read(
-                                                    assign_rows, [lbase + src0 + r, 0],
+                                                    assign_rows,
+                                                    [lbase + src0 + rb + r, 0],
                                                 )
                                                 tok = pl.cast(ar // TOPK, pl.INDEX)
                                                 xq_bf16 = pl.tile.assemble(
@@ -444,10 +460,10 @@ def moe_ffn_compute(
                                             # FP32 values.
                                             xq = pl.cast(xq_bf16, pl.FP32)
                                             quant_groups = pl.reshape(
-                                                xq, [RECV_TILE * XQ_GROUPS, 32],
+                                                xq, [AIV_ROW_TILE * XQ_GROUPS, 32],
                                             )
                                             quant_tmp = pl.create_tile(
-                                                [RECV_TILE * XQ_GROUPS, 32], dtype=pl.FP32,
+                                                [AIV_ROW_TILE * XQ_GROUPS, 32], dtype=pl.FP32,
                                             )
                                             quant_maximum = pl.maximum(
                                                 pl.row_max(
@@ -474,7 +490,7 @@ def moe_ffn_compute(
                                                 quant_clipped, pl.FP8E4M3FN, mode="rint",
                                             )
                                             x_quant = pl.reshape(
-                                                quant_payload, [RECV_TILE, XQ_TILE],
+                                                quant_payload, [AIV_ROW_TILE, XQ_TILE],
                                             )
                                             quant_signed = pl.sub(
                                                 quant_exponent,
@@ -484,28 +500,28 @@ def moe_ffn_compute(
                                                 pl.cast(quant_signed, pl.INT8), pl.UINT8,
                                             )
                                             quant_flat = pl.reshape(
-                                                quant_codes, [1, RECV_TILE * XQ_GROUPS],
+                                                quant_codes, [1, AIV_ROW_TILE * XQ_GROUPS],
                                             )
                                             quant_pack_tmp = pl.create_tile(
                                                 [1, XQ_SCALE_TMP], dtype=pl.UINT8,
                                             )
                                             quant_packed = pl.tmov_x2zz(
                                                 quant_flat, quant_pack_tmp, group_axis=1,
-                                                dst_rows=RECV_TILE, dst_cols=XQ_GROUPS,
+                                                dst_rows=AIV_ROW_TILE, dst_cols=XQ_GROUPS,
                                             )
                                             scale_quant = pl.reinterpret_view(
                                                 quant_packed, pl.FP8E8M0,
                                             )
                                             x_stage_mx = pl.store(
-                                                x_quant, [t0, k0], x_stage_mx,
+                                                x_quant, [t0 + rb, k0], x_stage_mx,
                                             )
-                                            scale_offset = t0 * K_SCALE + (
+                                            scale_offset = (t0 + rb) * K_SCALE + (
                                                 blk * (XQ_TASK_TILE // XQ_TILE) + qc
-                                            ) * RECV_TILE * XQ_GROUPS
+                                            ) * AIV_ROW_TILE * XQ_GROUPS
                                             x_stage_scale_backing = pl.store(
                                                 pl.reshape(
                                                     scale_quant,
-                                                    [1, RECV_TILE * XQ_GROUPS],
+                                                    [1, AIV_ROW_TILE * XQ_GROUPS],
                                                 ),
                                                 [0, scale_offset],
                                                 x_stage_scale_backing,
@@ -634,138 +650,136 @@ def moe_ffn_compute(
                                     ) as gate_up_act_quant_tid:
                                         ab_idx = pl.tile.get_block_idx()
                                         a_base = ab_idx * QUANT_TILE
-                                        h_fp32 = pl.tile.full(
-                                            [RECV_TILE, QUANT_TILE], dtype=pl.FP32,
-                                            value=0.0,
-                                        )
-                                        route_weight = pl.load(
-                                            w_compact, [lbase + src0, 0],
-                                            [RECV_TILE, 1],
-                                        )
-                                        for ag in pl.pipeline(ACT_GATE_INNER, stage=2):
-                                            a0 = a_base + ag * ACT_INTER_TILE
-                                            h_a0 = ag * ACT_INTER_TILE
-                                            # The fix-pipe already rounded
-                                            # gate/up to BF16 on drain (CANN's
-                                            # pre-SwiGLU rint); widen to FP32
-                                            # for the activation math.
-                                            gate_2d = pl.cast(
-                                                pl.load(
-                                                    gate_tile_bf16, [0, a0],
-                                                    [RECV_TILE, ACT_INTER_TILE],
-                                                ),
-                                                pl.FP32,
+                                        for rs in pl.range(RECV_TILE // AIV_ROW_TILE):
+                                            rb = rs * AIV_ROW_TILE
+                                            h_fp32 = pl.tile.full(
+                                                [AIV_ROW_TILE, QUANT_TILE], dtype=pl.FP32,
+                                                value=0.0,
                                             )
-                                            up_2d = pl.cast(
-                                                pl.load(
-                                                    up_tile_bf16, [0, a0],
-                                                    [RECV_TILE, ACT_INTER_TILE],
-                                                ),
-                                                pl.FP32,
+                                            route_weight = pl.load(
+                                                w_compact, [lbase + src0 + rb, 0],
+                                                [AIV_ROW_TILE, 1],
                                             )
-                                            if SWIGLU_LIMIT > 0.0:
-                                                gate_2d = pl.minimum(
-                                                    gate_2d, SWIGLU_LIMIT,
+                                            for ag in pl.pipeline(ACT_GATE_INNER, stage=2):
+                                                a0 = a_base + ag * ACT_INTER_TILE
+                                                h_a0 = ag * ACT_INTER_TILE
+                                                # The fix-pipe already rounded
+                                                # gate/up to BF16 on drain (CANN's
+                                                # pre-SwiGLU rint); widen to FP32
+                                                # for the activation math.
+                                                gate_2d = pl.cast(
+                                                    pl.load(
+                                                        gate_tile_bf16, [rb, a0],
+                                                        [AIV_ROW_TILE, ACT_INTER_TILE],
+                                                    ),
+                                                    pl.FP32,
                                                 )
-                                                up_2d = pl.maximum(
-                                                    pl.minimum(up_2d, SWIGLU_LIMIT),
-                                                    -SWIGLU_LIMIT,
+                                                up_2d = pl.cast(
+                                                    pl.load(
+                                                        up_tile_bf16, [rb, a0],
+                                                        [AIV_ROW_TILE, ACT_INTER_TILE],
+                                                    ),
+                                                    pl.FP32,
                                                 )
-                                            sigmoid = pl.recip(
-                                                pl.add(pl.exp(pl.neg(gate_2d)), 1.0),
+                                                if SWIGLU_LIMIT > 0.0:
+                                                    gate_2d = pl.minimum(
+                                                        gate_2d, SWIGLU_LIMIT,
+                                                    )
+                                                    up_2d = pl.maximum(
+                                                        pl.minimum(up_2d, SWIGLU_LIMIT),
+                                                        -SWIGLU_LIMIT,
+                                                    )
+                                                sigmoid = pl.recip(
+                                                    pl.add(pl.exp(pl.neg(gate_2d)), 1.0),
+                                                )
+                                                silu = pl.mul(gate_2d, sigmoid)
+                                                gated = pl.row_expand_mul(
+                                                    pl.mul(silu, up_2d), route_weight,
+                                                )
+                                                gated = pl.cast(
+                                                    pl.cast(gated, pl.BF16, mode="rint"),
+                                                    pl.FP32,
+                                                )
+                                                h_fp32 = pl.tile.assemble(
+                                                    h_fp32, gated, [0, h_a0],
+                                                )
+                                            # Row-local quant: rows past
+                                            # valid_rows carry finite slack
+                                            # values and are never scattered,
+                                            # so no validshape/fillpad dance.
+                                            # The released activation quantizer
+                                            # rounds the group scale upward.
+                                            sq_input = h_fp32
+                                            sq_values = pl.reshape(
+                                                sq_input, [AIV_ROW_TILE * SWIGLU_GROUPS, 32],
                                             )
-                                            silu = pl.mul(gate_2d, sigmoid)
-                                            gated = pl.row_expand_mul(
-                                                pl.mul(silu, up_2d), route_weight,
+                                            sq_reduce_tmp = pl.create_tile(
+                                                [AIV_ROW_TILE * SWIGLU_GROUPS, 32],
+                                                dtype=pl.FP32,
                                             )
-                                            gated = pl.cast(
-                                                pl.cast(gated, pl.BF16, mode="rint"),
-                                                pl.FP32,
+                                            sq_maximum = pl.maximum(
+                                                pl.row_max(
+                                                    pl.abs(sq_values), tmp_tile=sq_reduce_tmp,
+                                                ),
+                                                1e-4,
                                             )
-                                            h_fp32 = pl.tile.assemble(
-                                                h_fp32, gated, [0, h_a0],
+                                            sq_bits = pl.reinterpret_view(
+                                                pl.mul(sq_maximum, 1.0 / 448.0), pl.INT32,
                                             )
-                                        h_fp32_valid = pl.set_validshape(
-                                            h_fp32, valid_rows, QUANT_TILE,
-                                        )
-                                        h_fp32_padded = pl.fillpad(
-                                            h_fp32_valid, pad_value=pl.PadValue.zero,
-                                        )
-                                        # The released activation quantizer
-                                        # rounds the group scale upward.
-                                        sq_input = pl.set_validshape(
-                                            h_fp32_padded, RECV_TILE, QUANT_TILE,
-                                        )
-                                        sq_values = pl.reshape(
-                                            sq_input, [RECV_TILE * SWIGLU_GROUPS, 32],
-                                        )
-                                        sq_reduce_tmp = pl.create_tile(
-                                            [RECV_TILE * SWIGLU_GROUPS, 32],
-                                            dtype=pl.FP32,
-                                        )
-                                        sq_maximum = pl.maximum(
-                                            pl.row_max(
-                                                pl.abs(sq_values), tmp_tile=sq_reduce_tmp,
-                                            ),
-                                            1e-4,
-                                        )
-                                        sq_bits = pl.reinterpret_view(
-                                            pl.mul(sq_maximum, 1.0 / 448.0), pl.INT32,
-                                        )
-                                        sq_exponent = pl.shrs(
-                                            pl.add(sq_bits, 8388607), 23,
-                                        )
-                                        sq_scale = pl.reinterpret_view(
-                                            pl.shls(sq_exponent, 23), pl.FP32,
-                                        )
-                                        sq_normalized = pl.row_expand_div(
-                                            sq_values, sq_scale,
-                                        )
-                                        sq_clipped = pl.minimum(
-                                            pl.maximum(sq_normalized, -448.0), 448.0,
-                                        )
-                                        sq_quantized = pl.cast(
-                                            sq_clipped, pl.FP8E4M3FN, mode="rint",
-                                        )
-                                        h_quant = pl.reshape(
-                                            sq_quantized, [RECV_TILE, QUANT_TILE],
-                                        )
-                                        sq_signed_exponent = pl.sub(
-                                            sq_exponent,
-                                            pl.mul(pl.shrs(sq_exponent, 7), 256),
-                                        )
-                                        sq_codes = pl.reinterpret_view(
-                                            pl.cast(sq_signed_exponent, pl.INT8),
-                                            pl.UINT8,
-                                        )
-                                        sq_flat = pl.reshape(
-                                            sq_codes, [1, RECV_TILE * SWIGLU_GROUPS],
-                                        )
-                                        sq_temporary = pl.create_tile(
-                                            [1, SWIGLU_SCALE_TMP], dtype=pl.UINT8,
-                                        )
-                                        sq_packed = pl.tmov_x2zz(
-                                            sq_flat, sq_temporary, group_axis=1,
-                                            dst_rows=RECV_TILE,
-                                            dst_cols=SWIGLU_GROUPS,
-                                        )
-                                        h_scale = pl.reinterpret_view(
-                                            sq_packed, pl.FP8E8M0,
-                                        )
-                                        h_tile_mx = pl.store(
-                                            h_quant, [0, a_base], h_tile_mx,
-                                        )
-                                        scale_offset = (
-                                            ab_idx * RECV_TILE * (QUANT_TILE // MX_GROUP)
-                                        )
-                                        h_tile_scale_backing = pl.store(
-                                            pl.reshape(
-                                                h_scale,
-                                                [1, RECV_TILE * (QUANT_TILE // MX_GROUP)],
-                                            ),
-                                            [0, scale_offset],
-                                            h_tile_scale_backing,
-                                        )
+                                            sq_exponent = pl.shrs(
+                                                pl.add(sq_bits, 8388607), 23,
+                                            )
+                                            sq_scale = pl.reinterpret_view(
+                                                pl.shls(sq_exponent, 23), pl.FP32,
+                                            )
+                                            sq_normalized = pl.row_expand_div(
+                                                sq_values, sq_scale,
+                                            )
+                                            sq_clipped = pl.minimum(
+                                                pl.maximum(sq_normalized, -448.0), 448.0,
+                                            )
+                                            sq_quantized = pl.cast(
+                                                sq_clipped, pl.FP8E4M3FN, mode="rint",
+                                            )
+                                            h_quant = pl.reshape(
+                                                sq_quantized, [AIV_ROW_TILE, QUANT_TILE],
+                                            )
+                                            sq_signed_exponent = pl.sub(
+                                                sq_exponent,
+                                                pl.mul(pl.shrs(sq_exponent, 7), 256),
+                                            )
+                                            sq_codes = pl.reinterpret_view(
+                                                pl.cast(sq_signed_exponent, pl.INT8),
+                                                pl.UINT8,
+                                            )
+                                            sq_flat = pl.reshape(
+                                                sq_codes, [1, AIV_ROW_TILE * SWIGLU_GROUPS],
+                                            )
+                                            sq_temporary = pl.create_tile(
+                                                [1, SWIGLU_SCALE_TMP], dtype=pl.UINT8,
+                                            )
+                                            sq_packed = pl.tmov_x2zz(
+                                                sq_flat, sq_temporary, group_axis=1,
+                                                dst_rows=AIV_ROW_TILE,
+                                                dst_cols=SWIGLU_GROUPS,
+                                            )
+                                            h_scale = pl.reinterpret_view(
+                                                sq_packed, pl.FP8E8M0,
+                                            )
+                                            h_tile_mx = pl.store(
+                                                h_quant, [rb, a_base], h_tile_mx,
+                                            )
+                                            scale_offset = rb * H_SCALE + (
+                                                ab_idx * AIV_ROW_TILE * (QUANT_TILE // MX_GROUP)
+                                            )
+                                            h_tile_scale_backing = pl.store(
+                                                pl.reshape(
+                                                    h_scale,
+                                                    [1, AIV_ROW_TILE * (QUANT_TILE // MX_GROUP)],
+                                                ),
+                                                [0, scale_offset],
+                                                h_tile_scale_backing,
+                                            )
                                     chunk_hidden_tids[t] = gate_up_act_quant_tid
 
                             for tt in pl.parallel(chunk_tiles):
@@ -1069,6 +1083,7 @@ def validate(argv=None):
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
@@ -1087,6 +1102,7 @@ def validate(argv=None):
             platform=args.platform,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
+            enable_dep_gen=args.enable_dep_gen,
             # All 384 experts keep MXFP8 weight staging and activation tiles
             # live in one invocation; give the ring heap the same headroom
             # expert_routed.py asks for.
