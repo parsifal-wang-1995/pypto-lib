@@ -9,8 +9,7 @@
 """DeepSeek-V4.1 routed-expert MoE FFN (gate-after, single card).
 
 Scope: only the routed-expert FFN compute core lives here —
-activation gather + dynamic MXFP8 requant, GMM1 (one W13 N=4608 GEMM
-over the merged W1/W3 weights), SwiGLU with
+activation gather + dynamic MXFP8 requant, GMM1 (W1/W3), SwiGLU with
 route-weight application + requant, GMM2 (W2), and the top-k weighted
 aggregation. The MoE orchestration (``moe.py``), the router (``gate.py``),
 the EP dispatch/combine transport, and the shared expert
@@ -29,11 +28,8 @@ Inputs (the gate-after ABI):
   - ``x_normed``     [T_PAD, D] BF16       router-normed activations
   - ``topk_indices`` [T, TOPK] INT32       per-token expert ids in [0, E)
   - ``topk_weights`` [T, TOPK] FP32        normalized route weights (x1.5)
-  - ``routed_w13_packed`` [E, 92160, 128] UINT8  MXFP4 Cube-lane tiles,
-    per-expert row concatenation of the W1 and W3 tile blocks (W1 first)
-  - ``routed_w13_scale`` [E, K_SCALE, 4608] E8M0, MX_B_NN physical order,
-    gate scale columns [0, 2304) and up scale columns [2304, 4608)
-  - ``routed_w2_packed`` / ``routed_w2_scale``  W2, same tile form
+  - ``routed_w{1,2,3}_packed`` [E, 46080, 128] UINT8  MXFP4 Cube-lane tiles
+  - ``routed_w{1,2,3}_scale``  E8M0, MX_B_NN physical order
   - ``mxfp4_pair_lut`` [2, 256] INT16      AIV FP4->FP8 pair decoder table
 Output:
   - ``out`` [T, D] BF16 = sum_topk routed FFN (FP32 accumulate, one rint)
@@ -126,10 +122,6 @@ MX_W2_PACKED_TILES = 2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)
 MX_W1_PACKED_ROWS = MX_W1_PACKED_TILES * MX_PACKED_LANE_ROWS
 MX_W3_PACKED_ROWS = MX_W3_PACKED_TILES * MX_PACKED_LANE_ROWS
 MX_W2_PACKED_ROWS = MX_W2_PACKED_TILES * MX_PACKED_LANE_ROWS
-# W13 ABI: per expert the W1 and W3 packed tile rows are concatenated
-# (W1 first) into one carrier so GMM1 is a single N=2*MOE_INTER matmul.
-MX_W13_PACKED_TILES = MX_W1_PACKED_TILES + MX_W3_PACKED_TILES
-MX_W13_PACKED_ROWS = MX_W13_PACKED_TILES * MX_PACKED_LANE_ROWS
 assert MOE_INTER % MX_MM_TASK_TILE == 0
 assert D % MX_K_TILE == 0
 assert MX_MM_TASK_TILE % MX_MM_INTER_TILE == 0
@@ -170,12 +162,14 @@ def moe_ffn_compute(
     x_normed: pl.Tensor[[T_PAD, D], pl.BF16],
     topk_indices: pl.Tensor[[T, TOPK], pl.INT32],
     topk_weights: pl.Tensor[[T, TOPK], pl.FP32],
-    routed_w13_packed: pl.Tensor[
-        [E, MX_W13_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8,
+    routed_w1_packed: pl.Tensor[
+        [E, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8,
     ],
-    routed_w13_scale: pl.Tensor[
-        [E * K_SCALE, 2 * MOE_INTER], pl.FP8E8M0, pl.MX_B_NN,
+    routed_w1_scale: pl.Tensor[[E * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3_packed: pl.Tensor[
+        [E, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8,
     ],
+    routed_w3_scale: pl.Tensor[[E * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     routed_w2_packed: pl.Tensor[
         [E, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8,
     ],
@@ -266,22 +260,14 @@ def moe_ffn_compute(
             for tile in pl.range(MAX_TILES_PER_EXPERT):
                 tile_completion_tids[tile] = pl.system.task_dummy(deps=[])
             n_rows = pl.read(expert_count, [local_e, 0])
-            routed_w13_packed_e = routed_w13_packed[local_e, :, :]
+            routed_w1_packed_e = routed_w1_packed[local_e, :, :]
+            routed_w3_packed_e = routed_w3_packed[local_e, :, :]
             routed_w2_packed_e = routed_w2_packed[local_e, :, :]
             if n_rows > 0:
                 lbase = pl.cast(pl.read(list_base, [local_e, 0]), pl.INDEX)
                 pbase = pl.cast(pl.read(padded_base, [local_e, 0]), pl.INDEX)
                 with pl.scope():
-                    # W13 staging: one continuous [D, 2*MOE_INTER] FP8
-                    # buffer. The gate dequant fills columns [0, MOE_INTER)
-                    # from the carrier's W1 tile rows, the up dequant fills
-                    # [MOE_INTER, 2*MOE_INTER) from the W3 tile rows - both
-                    # through static per-task bases. manual_dep keeps the two
-                    # dequant waves concurrent (disjoint column ranges; the
-                    # merged GMM1 below depends on both completions).
-                    w13_mxfp8 = pl.create_tensor(
-                        [D, 2 * MOE_INTER], dtype=pl.FP8E4M3FN, manual_dep=True,
-                    )
+                    w1_mxfp8 = pl.create_tensor([D, MOE_INTER], dtype=pl.FP8E4M3FN)
                     with pl.spmd(
                         2 * (MOE_INTER // MX_MM_TASK_TILE),
                         name_hint="ffn_gate_mxfp4_aiv",
@@ -307,7 +293,7 @@ def moe_ffn_compute(
                                     + w1_lane * MX_PACKED_LANE_ROWS
                                 )
                                 w1_packed_tile = pl.load(
-                                    routed_w13_packed_e,
+                                    routed_w1_packed_e,
                                     [w1_packed_row, 0],
                                     [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
                                     target_memory=pl.Mem.Vec,
@@ -325,12 +311,13 @@ def moe_ffn_compute(
                                     w1_pair_codes, pl.INT8,
                                     shape=[MX_PACKED_LANE_ROWS, MX_MM_INTER_TILE],
                                 )
-                                w13_mxfp8 = pl.store(
+                                w1_mxfp8 = pl.store(
                                     pl.reinterpret_view(w1_bytes, pl.FP8E4M3FN),
                                     [k0 + w1_lane * MX_PACKED_LANE_ROWS, n0],
-                                    w13_mxfp8,
+                                    w1_mxfp8,
                                 )
 
+                    w3_mxfp8 = pl.create_tensor([D, MOE_INTER], dtype=pl.FP8E4M3FN)
                     with pl.spmd(
                         2 * (MOE_INTER // MX_MM_TASK_TILE),
                         name_hint="ffn_up_mxfp4_aiv",
@@ -352,12 +339,11 @@ def moe_ffn_compute(
                                     + k0 // MX_K_TILE
                                 )
                                 w3_packed_row = (
-                                    MX_W1_PACKED_ROWS
-                                    + w3_tile_id * 2 * MX_PACKED_LANE_ROWS
+                                    w3_tile_id * 2 * MX_PACKED_LANE_ROWS
                                     + w3_lane * MX_PACKED_LANE_ROWS
                                 )
                                 w3_packed_tile = pl.load(
-                                    routed_w13_packed_e,
+                                    routed_w3_packed_e,
                                     [w3_packed_row, 0],
                                     [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
                                     target_memory=pl.Mem.Vec,
@@ -375,13 +361,10 @@ def moe_ffn_compute(
                                     w3_pair_codes, pl.INT8,
                                     shape=[MX_PACKED_LANE_ROWS, MX_MM_INTER_TILE],
                                 )
-                                w13_mxfp8 = pl.store(
+                                w3_mxfp8 = pl.store(
                                     pl.reinterpret_view(w3_bytes, pl.FP8E4M3FN),
-                                    [
-                                        k0 + w3_lane * MX_PACKED_LANE_ROWS,
-                                        MOE_INTER + n0,
-                                    ],
-                                    w13_mxfp8,
+                                    [k0 + w3_lane * MX_PACKED_LANE_ROWS, n0],
+                                    w3_mxfp8,
                                 )
 
                     w2_mxfp8 = pl.create_tensor([MOE_INTER, D], dtype=pl.FP8E4M3FN)
@@ -594,39 +577,36 @@ def moe_ffn_compute(
                                                 x_stage_scale_backing,
                                             )
 
-                                    # GMM1 is ONE N=4608 matmul over the
-                                    # merged W13 staging: gate occupies output
-                                    # columns [0, MOE_INTER), up occupies
-                                    # [MOE_INTER, 2*MOE_INTER). The scale row
-                                    # base is the single static local_e*K_SCALE
-                                    # (no block-index-derived slot bases), and
-                                    # K/N tile widths stay 256x256. It drains
-                                    # through the fix-pipe straight to BF16:
-                                    # exactly the pre-SwiGLU rint CANN applies,
-                                    # with no FP32 GM round-trip.
-                                    w13_tile_bf16 = pl.create_tensor(
-                                        [RECV_TILE, 2 * MOE_INTER], dtype=pl.BF16,
+                                    # GMM1 drains through the fix-pipe straight
+                                    # to BF16: exactly the pre-SwiGLU rint CANN
+                                    # applies, with no FP32 GM round-trip.
+                                    gate_tile_bf16 = pl.create_tensor(
+                                        [RECV_TILE, MOE_INTER], dtype=pl.BF16,
                                     )
+                                    up_tile_bf16 = pl.create_tensor(
+                                        [RECV_TILE, MOE_INTER], dtype=pl.BF16,
+                                    )
+
                                     with pl.spmd(
-                                        2 * (MOE_INTER // MX_MM_TASK_TILE),
-                                        name_hint="ffn_w13_mxfp4_aic",
-                                        deps=[w1_deq_tid, w3_deq_tid, xquant_tid],
-                                    ) as w13_mxfp4_aic_tid:
+                                        MOE_INTER // MX_MM_TASK_TILE,
+                                        name_hint="ffn_gate_mxfp4_aic",
+                                        deps=[w1_deq_tid, xquant_tid],
+                                    ) as gate_mxfp4_aic_tid:
                                         nb_idx = pl.tile.get_block_idx()
                                         n_base = nb_idx * MX_MM_TASK_TILE
                                         for ng in pl.range(
                                             MX_MM_TASK_TILE // MX_MM_INTER_TILE
                                         ):
                                             n0 = n_base + ng * MX_MM_INTER_TILE
-                                            w13_scale_row_base = local_e * K_SCALE
-                                            w13_acc = pl.create_tile(
+                                            w1_scale_row_base = local_e * K_SCALE
+                                            gate_acc = pl.create_tile(
                                                 [RECV_TILE, MX_MM_INTER_TILE],
                                                 dtype=pl.FP32, target_memory=pl.Mem.Acc,
                                             )
                                             for k0 in pl.range(0, D, MX_K_TILE):
                                                 ks = k0 // MX_GROUP
-                                                w13_tile = pl.load(
-                                                    w13_mxfp8, [k0, n0],
+                                                w1_tile = pl.load(
+                                                    w1_mxfp8, [k0, n0],
                                                     [MX_K_TILE, MX_MM_INTER_TILE],
                                                     target_memory=pl.Mem.Mat,
                                                 )
@@ -639,24 +619,74 @@ def moe_ffn_compute(
                                                     [RECV_TILE, MX_K_SCALE_GROUPS],
                                                     target_memory=pl.Mem.Mat,
                                                 )
-                                                w13_scale_k = pl.load(
-                                                    routed_w13_scale,
-                                                    [w13_scale_row_base + ks, n0],
+                                                w1_scale_k = pl.load(
+                                                    routed_w1_scale,
+                                                    [w1_scale_row_base + ks, n0],
                                                     [MX_K_SCALE_GROUPS, MX_MM_INTER_TILE],
                                                     target_memory=pl.Mem.Mat,
                                                 )
                                                 if k0 == 0:
-                                                    w13_acc = pl.matmul_mx(
-                                                        xs_k, xs_scale_k,
-                                                        w13_tile, w13_scale_k,
+                                                    gate_acc = pl.matmul_mx(
+                                                        xs_k, xs_scale_k, w1_tile, w1_scale_k,
                                                     )
                                                 else:
-                                                    w13_acc = pl.matmul_mx_acc(
-                                                        w13_acc, xs_k, xs_scale_k,
-                                                        w13_tile, w13_scale_k,
+                                                    gate_acc = pl.matmul_mx_acc(
+                                                        gate_acc, xs_k, xs_scale_k,
+                                                        w1_tile, w1_scale_k,
                                                     )
-                                            w13_tile_bf16 = pl.store(
-                                                w13_acc, [0, n0], w13_tile_bf16,
+                                            gate_tile_bf16 = pl.store(
+                                                gate_acc, [0, n0], gate_tile_bf16,
+                                            )
+
+                                    with pl.spmd(
+                                        MOE_INTER // MX_MM_TASK_TILE,
+                                        name_hint="ffn_up_mxfp4_aic",
+                                        deps=[w3_deq_tid, xquant_tid],
+                                    ) as up_mxfp4_aic_tid:
+                                        nb_idx = pl.tile.get_block_idx()
+                                        n_base = nb_idx * MX_MM_TASK_TILE
+                                        for ng in pl.range(
+                                            MX_MM_TASK_TILE // MX_MM_INTER_TILE
+                                        ):
+                                            n0 = n_base + ng * MX_MM_INTER_TILE
+                                            w3_scale_row_base = local_e * K_SCALE
+                                            up_acc = pl.create_tile(
+                                                [RECV_TILE, MX_MM_INTER_TILE],
+                                                dtype=pl.FP32, target_memory=pl.Mem.Acc,
+                                            )
+                                            for k0 in pl.range(0, D, MX_K_TILE):
+                                                ks = k0 // MX_GROUP
+                                                w3_tile = pl.load(
+                                                    w3_mxfp8, [k0, n0],
+                                                    [MX_K_TILE, MX_MM_INTER_TILE],
+                                                    target_memory=pl.Mem.Mat,
+                                                )
+                                                xs_k = pl.load(
+                                                    x_stage_mx, [t0, k0],
+                                                    [RECV_TILE, MX_K_TILE],
+                                                )
+                                                xs_scale_k = pl.load(
+                                                    x_stage_scale_mx, [t0, ks],
+                                                    [RECV_TILE, MX_K_SCALE_GROUPS],
+                                                    target_memory=pl.Mem.Mat,
+                                                )
+                                                w3_scale_k = pl.load(
+                                                    routed_w3_scale,
+                                                    [w3_scale_row_base + ks, n0],
+                                                    [MX_K_SCALE_GROUPS, MX_MM_INTER_TILE],
+                                                    target_memory=pl.Mem.Mat,
+                                                )
+                                                if k0 == 0:
+                                                    up_acc = pl.matmul_mx(
+                                                        xs_k, xs_scale_k, w3_tile, w3_scale_k,
+                                                    )
+                                                else:
+                                                    up_acc = pl.matmul_mx_acc(
+                                                        up_acc, xs_k, xs_scale_k,
+                                                        w3_tile, w3_scale_k,
+                                                    )
+                                            up_tile_bf16 = pl.store(
+                                                up_acc, [0, n0], up_tile_bf16,
                                             )
 
                                     h_tile_mx = h_mx[t0 : t0 + RECV_TILE]
@@ -666,7 +696,7 @@ def moe_ffn_compute(
                                     with pl.spmd(
                                         MOE_INTER // QUANT_TILE,
                                         name_hint="ffn_gate_up_act_quant",
-                                        deps=[w13_mxfp4_aic_tid],
+                                        deps=[gate_mxfp4_aic_tid, up_mxfp4_aic_tid],
                                     ) as gate_up_act_quant_tid:
                                         ab_idx = pl.tile.get_block_idx()
                                         a_base = ab_idx * QUANT_TILE
@@ -690,15 +720,14 @@ def moe_ffn_compute(
                                                 # for the activation math.
                                                 gate_2d = pl.cast(
                                                     pl.load(
-                                                        w13_tile_bf16, [rb, a0],
+                                                        gate_tile_bf16, [rb, a0],
                                                         [AIV_ROW_TILE, ACT_INTER_TILE],
                                                     ),
                                                     pl.FP32,
                                                 )
                                                 up_2d = pl.cast(
                                                     pl.load(
-                                                        w13_tile_bf16,
-                                                        [rb, a0 + MOE_INTER],
+                                                        up_tile_bf16, [rb, a0],
                                                         [AIV_ROW_TILE, ACT_INTER_TILE],
                                                     ),
                                                     pl.FP32,
@@ -918,12 +947,14 @@ def moe_ffn_test(
     x_normed: pl.Tensor[[T_PAD, D], pl.BF16],
     topk_indices: pl.Tensor[[T, TOPK], pl.INT32],
     topk_weights: pl.Tensor[[T, TOPK], pl.FP32],
-    routed_w13_packed: pl.Tensor[
-        [E, MX_W13_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8,
+    routed_w1_packed: pl.Tensor[
+        [E, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8,
     ],
-    routed_w13_scale: pl.Tensor[
-        [E * K_SCALE, 2 * MOE_INTER], pl.FP8E8M0, pl.MX_B_NN,
+    routed_w1_scale: pl.Tensor[[E * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3_packed: pl.Tensor[
+        [E, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8,
     ],
+    routed_w3_scale: pl.Tensor[[E * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     routed_w2_packed: pl.Tensor[
         [E, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8,
     ],
@@ -933,7 +964,8 @@ def moe_ffn_test(
 ):
     out = moe_ffn_compute(
         x_normed, topk_indices, topk_weights,
-        routed_w13_packed, routed_w13_scale,
+        routed_w1_packed, routed_w1_scale,
+        routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale,
         mxfp4_pair_lut, out,
     )
@@ -955,11 +987,12 @@ def golden_moe_ffn(tensors):
     x = tensors["x_normed"][:T].float()
     indices = tensors["topk_indices"].to(torch.int64)
     weights = tensors["topk_weights"].float()
-    w13_scale = decode_e8m0_codes(tensors["routed_w13_scale"], side="b").reshape(
-        E, K_SCALE, 2 * MOE_INTER,
+    w1_scale = decode_e8m0_codes(tensors["routed_w1_scale"], side="b").reshape(
+        E, K_SCALE, MOE_INTER,
     )
-    w1_scale = w13_scale[:, :, :MOE_INTER]
-    w3_scale = w13_scale[:, :, MOE_INTER:]
+    w3_scale = decode_e8m0_codes(tensors["routed_w3_scale"], side="b").reshape(
+        E, K_SCALE, MOE_INTER,
+    )
     w2_scale = decode_e8m0_codes(tensors["routed_w2_scale"], side="b").reshape(
         E, H_SCALE, D,
     )
@@ -973,15 +1006,14 @@ def golden_moe_ffn(tensors):
         route_w = weights[hits[:, 0], hits[:, 1]].reshape(-1, 1)
         x_sub = x[tokens]
         x_fp8, x_codes = host_quant_swiglu_mxfp8(x_sub, return_e8m0=True)
-        w13_packed_e = tensors["routed_w13_packed"][e]
         w1_fp8 = unpack_mxfp4_weight_tiles(
-            w13_packed_e[:MX_W1_PACKED_ROWS].reshape(
+            tensors["routed_w1_packed"][e].reshape(
                 MX_W1_PACKED_TILES, MX_K_TILE * MX_MM_INTER_TILE // 4,
             ),
             D, MOE_INTER, MX_K_TILE, MX_MM_INTER_TILE,
         )
         w3_fp8 = unpack_mxfp4_weight_tiles(
-            w13_packed_e[MX_W1_PACKED_ROWS:].reshape(
+            tensors["routed_w3_packed"][e].reshape(
                 MX_W3_PACKED_TILES, MX_K_TILE * MX_MM_INTER_TILE // 4,
             ),
             D, MOE_INTER, MX_K_TILE, MX_MM_INTER_TILE,
@@ -1011,11 +1043,7 @@ def build_tensor_specs():
     import torch
 
     from golden.spec import TensorSpec
-    from quant import (
-        build_mxfp4_pair_lut,
-        pack_mx_b_scale,
-        unpack_mx_b_scale,
-    )
+    from quant import build_mxfp4_pair_lut
     from expert_routed import gen_routed_mxfp4_weights
 
     generator = torch.Generator().manual_seed(20261016)
@@ -1045,38 +1073,25 @@ def build_tensor_specs():
 
     fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
-    def gen_w13_scale():
-        """Merged W13 scale backing: pack the LOGICAL column concatenation.
-
-        MX_B_NN physically interleaves (n-block, k-pair), so a byte-level cat
-        of the W1/W3 backings is not the merged physical layout; decode both
-        to logical [E*K_SCALE, MOE_INTER] rows, concatenate along N, and
-        re-pack into [E*K_SCALE, 2*MOE_INTER].
-        """
-        logical = torch.cat(
-            [
-                unpack_mx_b_scale(gen_weights()[1].view(torch.uint8)),
-                unpack_mx_b_scale(gen_weights()[3].view(torch.uint8)),
-            ],
-            dim=1,
-        )
-        packed = pack_mx_b_scale(logical)
-        return packed.view(fp8_e8m0) if fp8_e8m0 is not torch.uint8 else packed
-
     return [
         TensorSpec("x_normed", [T_PAD, D], torch.bfloat16, init_value=lambda: x_normed),
         TensorSpec("topk_indices", [T, TOPK], torch.int32, init_value=lambda: topk_indices),
         TensorSpec("topk_weights", [T, TOPK], torch.float32, init_value=lambda: topk_weights),
         TensorSpec(
-            "routed_w13_packed", [E, MX_W13_PACKED_ROWS, MX_PACKED_LANE_COLS],
-            torch.uint8,
-            init_value=lambda: torch.cat(
-                [gen_weights()[0], gen_weights()[2]], dim=1,
-            ),
+            "routed_w1_packed", [E, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
+            torch.uint8, init_value=lambda: gen_weights()[0],
         ),
         TensorSpec(
-            "routed_w13_scale", [E * K_SCALE, 2 * MOE_INTER], fp8_e8m0,
-            init_value=gen_w13_scale,
+            "routed_w1_scale", [E * K_SCALE, MOE_INTER], fp8_e8m0,
+            init_value=lambda: gen_weights()[1],
+        ),
+        TensorSpec(
+            "routed_w3_packed", [E, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
+            torch.uint8, init_value=lambda: gen_weights()[2],
+        ),
+        TensorSpec(
+            "routed_w3_scale", [E * K_SCALE, MOE_INTER], fp8_e8m0,
+            init_value=lambda: gen_weights()[3],
         ),
         TensorSpec(
             "routed_w2_packed", [E, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
