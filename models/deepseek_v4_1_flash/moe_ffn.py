@@ -80,18 +80,22 @@ TOPK = M.num_experts_per_tok
 # Direction-i double-buffer knob (import-time, like --experts): pipeline the
 # k0 loop of the three in-kernel FP4->FP8 dequant waves
 # (ffn_gate_mxfp4_aiv / ffn_up_mxfp4_aiv / ffn_w2_mxfp4_aiv).
-#   --deq-stage 1 (default) keeps the kernel byte-identical to the pre-knob
-#       build: lower_pipeline_loops only triggers for stage > 1, and the k0
-#       body's source order (scalar addresses -> load -> compute -> store)
-#       already matches canonicalize_io_order's stable tier order.
-#   --deq-stage 2 replicates the k0 body twice per outer iteration
-#       (ping-pong). PMU profiling (dequant_pmu.md) shows these waves are a
+#   --deq-stage 2 (default since t23: t15 same-HEAD A/B measured it optimal,
+#       -12.14% e2e / median 814.6us vs 927.15us single-buffered; t16 review
+#       go) replicates the k0 body twice per outer iteration (ping-pong).
+#       PMU profiling (dequant_pmu.md) shows these waves are a
 #       vec 47.4% <-> MTE 50.7% serial ping-pong, so overlapping iteration
-#       i+1's loads with iteration i's LUT gather/cast is the payoff form.
+#       i+1's loads with iteration i's LUT gather/cast is the payoff form
+#       (device: dequant core-time 1.486x, e2e -112.55us).
+#   --deq-stage 1 keeps the legacy single-buffered form: byte-identical to
+#       the pre-knob build, because lower_pipeline_loops only triggers for
+#       stage > 1 and the k0 body's source order (scalar addresses -> load
+#       -> compute -> store) already matches canonicalize_io_order's stable
+#       tier order (t14/t16: 21/21 artifacts identical at stage=1).
 # Numerics are untouched: each k0 iteration still streams the same packed
 # tile through the same cast/gather/view chain into the same [k0, n0)
 # region; the knob only changes when the DMA engine may start.
-DEQ_STAGE = _parse_cli_int("deq-stage", 1)
+DEQ_STAGE = _parse_cli_int("deq-stage", 2)
 if DEQ_STAGE not in (1, 2):
     # Deeper scans are out of scope (midpoint replan): the dense-campaign
     # stage=3 builds regressed 12-37%, and act (vec-saturated, UB 73.4%),
@@ -1177,8 +1181,8 @@ def validate(argv=None):
                         "(384=single-card, 12=EP32 per-card form); import-time knob")
     parser.add_argument("--deq-stage", type=int, default=None, choices=(1, 2),
                         help="dequant k0 double-buffer depth; import-time knob "
-                        "(1=single-buffered default, 2=pl.pipeline stage=2 "
-                        "ping-pong)")
+                        "(1=legacy single-buffered, 2=pl.pipeline stage=2 "
+                        "ping-pong, default since t23)")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
