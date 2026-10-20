@@ -77,6 +77,57 @@ SWIGLU_LIMIT = M.swiglu_limit
 E = _parse_cli_int("experts", M.n_routed_experts)
 TOPK = M.num_experts_per_tok
 
+# Direction-i double-buffer knob (import-time, like --experts): pipeline the
+# k0 loop of the three in-kernel FP4->FP8 dequant waves
+# (ffn_gate_mxfp4_aiv / ffn_up_mxfp4_aiv / ffn_w2_mxfp4_aiv).
+#   --deq-stage 1 (default) keeps the kernel byte-identical to the pre-knob
+#       build: lower_pipeline_loops only triggers for stage > 1, and the k0
+#       body's source order (scalar addresses -> load -> compute -> store)
+#       already matches canonicalize_io_order's stable tier order.
+#   --deq-stage 2 replicates the k0 body twice per outer iteration
+#       (ping-pong). PMU profiling (dequant_pmu.md) shows these waves are a
+#       vec 47.4% <-> MTE 50.7% serial ping-pong, so overlapping iteration
+#       i+1's loads with iteration i's LUT gather/cast is the payoff form.
+# Numerics are untouched: each k0 iteration still streams the same packed
+# tile through the same cast/gather/view chain into the same [k0, n0)
+# region; the knob only changes when the DMA engine may start.
+DEQ_STAGE = _parse_cli_int("deq-stage", 1)
+if DEQ_STAGE not in (1, 2):
+    # Deeper scans are out of scope (midpoint replan): the dense-campaign
+    # stage=3 builds regressed 12-37%, and act (vec-saturated, UB 73.4%),
+    # GMM (L0B 100%), and xgather (already batched) waves are excluded.
+    raise SystemExit(
+        f"--deq-stage must be 1 or 2, got {DEQ_STAGE}; deeper scans and the "
+        "act/GMM/xgather waves are out of scope"
+    )
+# Capacity gate (A5/Ascend950, p0-codegen-audit.md section 7):
+#   UB (Vec) capacity .............. 245,760 B
+#   measured stage=1 peak/task .....  98,816 B (40.2%, audit build)
+#   clone-set increment per stage .. +94,304 B -> stage=2 gate basis
+#   193,120 B (78.5%): cloning makes sibling clones' input/output tiles
+#   co-live (canonicalize_io_order), so the audit's upper bound is the gate
+#   basis; stage >= 3 (>= 287,424 B) is rejected. The L1/L0 waves are
+#   untouched (GMM excluded), so no L1 estimate applies here.
+#   Measured stage=2 occupancy (audit_pto.py, build _20261020_122345_v_xv5jla,
+#   E=12): ffn_gate/up_mxfp4_aiv 197,120 B (80.2%), ffn_w2_mxfp4_aiv
+#   229,888 B (93.5%; the odd 9-trip k0 loop's flattened tail clone adds a
+#   third staging region). Both sit above the 80% guidance band but inside
+#   hardware capacity (placement is legal); that build is golden-PASS on
+#   device and benches 815.0us vs 926.8us single-buffered in the same
+#   window. The guidance-vs-measured trade-off is left to review; the
+#   compile gate below stays on the estimate basis.
+_UB_CAPACITY_BYTES = 245_760
+_UB_GATE_FRACTION = 0.80
+_DEQ_UB_BASE_BYTES = 98_816
+_DEQ_UB_PER_EXTRA_STAGE = 94_304
+_deq_ub_estimate = _DEQ_UB_BASE_BYTES + (DEQ_STAGE - 1) * _DEQ_UB_PER_EXTRA_STAGE
+if _deq_ub_estimate > _UB_GATE_FRACTION * _UB_CAPACITY_BYTES:
+    raise SystemExit(
+        f"--deq-stage {DEQ_STAGE}: dequant UB estimate {_deq_ub_estimate} B "
+        f"exceeds the 80% gate ({int(_UB_GATE_FRACTION * _UB_CAPACITY_BYTES)} "
+        f"B of {_UB_CAPACITY_BYTES} B); refusing to build"
+    )
+
 T_PAD = ((T + 15) // 16) * 16
 TOTAL = T * TOPK
 # Activation/hidden staging is chunked per expert: one expert's rows are
@@ -283,7 +334,7 @@ def moe_ffn_compute(
                         )
                         for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
                             n0 = nbase_d1 + ng * MX_MM_INTER_TILE
-                            for k0 in pl.range(0, D, MX_K_TILE):
+                            for k0 in pl.pipeline(0, D, MX_K_TILE, stage=DEQ_STAGE):
                                 w1_tile_id = (
                                     (n0 // MX_MM_INTER_TILE) * (D // MX_K_TILE)
                                     + k0 // MX_K_TILE
@@ -333,7 +384,7 @@ def moe_ffn_compute(
                         )
                         for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
                             n0 = nbase_d3 + ng * MX_MM_INTER_TILE
-                            for k0 in pl.range(0, D, MX_K_TILE):
+                            for k0 in pl.pipeline(0, D, MX_K_TILE, stage=DEQ_STAGE):
                                 w3_tile_id = (
                                     (n0 // MX_MM_INTER_TILE) * (D // MX_K_TILE)
                                     + k0 // MX_K_TILE
@@ -383,7 +434,7 @@ def moe_ffn_compute(
                         )
                         for dg in pl.range(MX_W2_TASK_TILE // MX_W2_D_OUT_TILE):
                             d0 = dbase_d2 + dg * MX_W2_D_OUT_TILE
-                            for k0 in pl.range(0, MOE_INTER, MX_K_TILE):
+                            for k0 in pl.pipeline(0, MOE_INTER, MX_K_TILE, stage=DEQ_STAGE):
                                 w2_tile_id = (
                                     (d0 // MX_W2_D_OUT_TILE) * (MOE_INTER // MX_K_TILE)
                                     + k0 // MX_K_TILE
@@ -1124,6 +1175,10 @@ def validate(argv=None):
     parser.add_argument("--experts", type=int, default=None,
                         help="routed experts resident on this card "
                         "(384=single-card, 12=EP32 per-card form); import-time knob")
+    parser.add_argument("--deq-stage", type=int, default=None, choices=(1, 2),
+                        help="dequant k0 double-buffer depth; import-time knob "
+                        "(1=single-buffered default, 2=pl.pipeline stage=2 "
+                        "ping-pong)")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
