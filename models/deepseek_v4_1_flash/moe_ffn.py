@@ -106,24 +106,29 @@ if DEQ_STAGE not in (1, 2):
     )
 # Capacity gate (A5/Ascend950, p0-codegen-audit.md section 7):
 #   UB (Vec) capacity .............. 245,760 B
-#   measured stage=1 peak/task .....  98,816 B (40.2%, audit build)
-#   clone-set increment per stage .. +94,304 B -> stage=2 gate basis
+#   measured stage=1 peak/task .....  98,816 B (40.2%, audit build, before
+#                                      the dead-tmp shrink below)
+#   clone-set increment per stage .. +94,304 B -> stage=2 basis
 #   193,120 B (78.5%): cloning makes sibling clones' input/output tiles
 #   co-live (canonicalize_io_order), so the audit's upper bound is the gate
 #   basis; stage >= 3 (>= 287,424 B) is rejected. The L1/L0 waves are
 #   untouched (GMM excluded), so no L1 estimate applies here.
-#   Measured stage=2 occupancy (audit_pto.py, build _20261020_122345_v_xv5jla,
-#   E=12): ffn_gate/up_mxfp4_aiv 197,120 B (80.2%), ffn_w2_mxfp4_aiv
-#   229,888 B (93.5%; the odd 9-trip k0 loop's flattened tail clone adds a
-#   third staging region). Both sit above the 80% guidance band but inside
-#   hardware capacity (placement is legal); that build is golden-PASS on
-#   device and benches 815.0us vs 926.8us single-buffered in the same
-#   window. The guidance-vs-measured trade-off is left to review; the
-#   compile gate below stays on the estimate basis.
+#   t23 dead-tmp shrink: the tgather index-form tmp ([128,128] i16 = 32KB
+#   per pipeline stage; w2's odd-trip tail clone staged a third one) is
+#   never read on A5, so it is now allocated as [1,16] (32B, the
+#   alloc_tile 32-byte row-alignment floor). That removes 32,768 B from
+#   the stage=1 basis and 32,768 B per extra stage:
+#     stage=1  66,048 B, stage=2 127,584 B, stage=3 189,120 B.
+#   Pre-shrink measured stage=2 occupancy was ffn_gate/up 197,120 B (80.2%)
+#   and ffn_w2 229,888 B (93.5%, tail clone's third staging region);
+#   post-shrink measured (audit_pto.py, E=12 build
+#   _jit_moe_ffn_test_20261020_131336_ipnjvt4l): ffn_gate/up 131,648 B and
+#   ffn_w2 131,680 B = 53.6% each - back inside the 80% guidance band that
+#   stage=2 previously exceeded (t14's open trade-off resolved).
 _UB_CAPACITY_BYTES = 245_760
 _UB_GATE_FRACTION = 0.80
-_DEQ_UB_BASE_BYTES = 98_816
-_DEQ_UB_PER_EXTRA_STAGE = 94_304
+_DEQ_UB_BASE_BYTES = 66_048
+_DEQ_UB_PER_EXTRA_STAGE = 61_536
 _deq_ub_estimate = _DEQ_UB_BASE_BYTES + (DEQ_STAGE - 1) * _DEQ_UB_PER_EXTRA_STAGE
 if _deq_ub_estimate > _UB_GATE_FRACTION * _UB_CAPACITY_BYTES:
     raise SystemExit(
@@ -355,8 +360,23 @@ def moe_ffn_compute(
                                 )
                                 w1_packed_u16 = pl.cast(w1_packed_tile, target_type=pl.UINT16)
                                 w1_packed_indices = pl.reinterpret_view(w1_packed_u16, pl.INT16)
+                                # A5 never reads the tgather index-form tmp: the IR
+                                # verifier only requires "a Vec tile operand"
+                                # ("A5 (Ascend950) does not read tmp in the index form
+                                # and imposes no tmp dtype/shape relation",
+                                # tile_ops/gather.cpp), and TGATHER_IMPL dispatches
+                                # the b16 path as TGather_b16(dst, src, indices)
+                                # without tmp (pto-isa TGather.hpp). The previous
+                                # [128,128] i16 tmp burned 32KB of Vec space per
+                                # pipeline stage (2 stages + w2's tail clone => up to
+                                # 96KB/task, ~1/3 of the stage=2 footprint) for
+                                # nothing; a [1,16] tile (32B, the alloc_tile
+                                # 32-byte row-alignment floor) keeps the required
+                                # operand while freeing that UB (dense-campaign K2
+                                # tiny-tmp precedent). dst/indices keep full
+                                # [128,128] shapes.
                                 w1_gather_tmp = pl.create_tile(
-                                    [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
+                                    [1, 16],
                                     dtype=pl.INT16, target_memory=pl.Mem.Vec,
                                 )
                                 w1_pair_codes = pl.tile.gather(
@@ -405,8 +425,10 @@ def moe_ffn_compute(
                                 )
                                 w3_packed_u16 = pl.cast(w3_packed_tile, target_type=pl.UINT16)
                                 w3_packed_indices = pl.reinterpret_view(w3_packed_u16, pl.INT16)
+                                # Same dead-tmp shrink as w1 above: A5's b16 gather
+                                # path never reads tmp (see the w1 comment).
                                 w3_gather_tmp = pl.create_tile(
-                                    [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
+                                    [1, 16],
                                     dtype=pl.INT16, target_memory=pl.Mem.Vec,
                                 )
                                 w3_pair_codes = pl.tile.gather(
@@ -455,8 +477,13 @@ def moe_ffn_compute(
                                 )
                                 w2_packed_u16 = pl.cast(w2_packed_tile, target_type=pl.UINT16)
                                 w2_packed_indices = pl.reinterpret_view(w2_packed_u16, pl.INT16)
+                                # Same dead-tmp shrink as w1 above: A5's b16 gather
+                                # path never reads tmp (see the w1 comment). w2's
+                                # odd-trip k0 loop's flattened tail clone staged a
+                                # third full tmp region, so this frees up to 3x32KB
+                                # here (measured 229,888B -> see capacity gate).
                                 w2_gather_tmp = pl.create_tile(
-                                    [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
+                                    [1, 16],
                                     dtype=pl.INT16, target_memory=pl.Mem.Vec,
                                 )
                                 w2_pair_codes = pl.tile.gather(
