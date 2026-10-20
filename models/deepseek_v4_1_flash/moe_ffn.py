@@ -189,7 +189,7 @@ def moe_ffn_compute(
         expert_count = pl.create_tensor([E, 1], dtype=pl.INT32)
         list_base = pl.create_tensor([E, 1], dtype=pl.INT32)
         padded_base = pl.create_tensor([E, 1], dtype=pl.INT32)
-        assign_rows = pl.create_tensor([TOTAL + RECV_TILE, 1], dtype=pl.INT32)
+        tok_ids = pl.create_tensor([TOTAL + RECV_TILE, 1], dtype=pl.INT32)
         w_compact = pl.create_tensor([TOTAL + RECV_TILE, 1], dtype=pl.FP32)
         route_pos = pl.create_tensor([TOTAL, 1], dtype=pl.INT32)
         with pl.at(
@@ -224,7 +224,7 @@ def moe_ffn_compute(
                 for k in pl.range(TOPK):
                     eid = pl.tile.read(indices_tile, [t, k])
                     pos = pl.read(list_base, [eid, 0]) + counts[eid]
-                    pl.write(assign_rows, [pos, 0], pl.cast(t * TOPK + k, pl.INT32))
+                    pl.write(tok_ids, [pos, 0], pl.cast(t, pl.INT32))
                     pl.write(w_compact, [pos, 0], pl.tile.read(weights_tile, [t, k]))
                     pl.write(
                         route_pos,
@@ -234,7 +234,7 @@ def moe_ffn_compute(
                     counts[eid] = counts[eid] + 1
             for r in pl.range(RECV_TILE):
                 pl.write(w_compact, [TOTAL + r, 0], pl.const(0.0, pl.FP32))
-                pl.write(assign_rows, [TOTAL + r, 0], pl.const(0, pl.INT32))
+                pl.write(tok_ids, [TOTAL + r, 0], pl.const(0, pl.INT32))
             for e in pl.range(E):
                 pl.write(expert_count, [e, 0], counts[e])
 
@@ -449,9 +449,18 @@ def moe_ffn_compute(
                                 valid_rows = pl.min(RECV_TILE, chunk_rows - t0)
                                 src0 = chunk_row0 + t0
                                 with pl.scope():
-                                    # Gather this tile's activations by route id
-                                    # and requant to MXFP8 (ceil E8M0 scales,
-                                    # like gate.py).
+                                    # Gather this tile's activations by route
+                                    # id and requant to MXFP8 (ceil E8M0
+                                    # scales, like gate.py). Transport is
+                                    # batched: the 16 rows' source tokens
+                                    # arrive as one 64B tile window (no
+                                    # per-row scalar index reads from GM) and
+                                    # each row is DMA'd straight into its
+                                    # tile slot by pl.gather_row (GM -> UB
+                                    # direct, no load+assemble round trip).
+                                    # The quantizer itself is unchanged, so
+                                    # the staged bytes are bit-identical to
+                                    # the original per-row path.
                                     with pl.spmd(
                                         D // XQ_TASK_TILE,
                                         name_hint="ffn_xgather_quant",
@@ -467,26 +476,35 @@ def moe_ffn_compute(
                                             ) * AIV_ROW_TILE
                                             qc = rq % (XQ_TASK_TILE // XQ_TILE)
                                             k0 = blk * XQ_TASK_TILE + qc * XQ_TILE
-                                            xq_bf16 = pl.tile.full(
-                                                [AIV_ROW_TILE, XQ_TILE], dtype=pl.BF16,
-                                                value=0.0,
+                                            # Reads may spill past this
+                                            # expert's rows into the next
+                                            # expert's region or the
+                                            # zero-filled slack (token 0
+                                            # rows; only valid_rows are
+                                            # consumed later).
+                                            tok_tile = pl.load(
+                                                tok_ids,
+                                                [lbase + src0 + rb, 0],
+                                                [AIV_ROW_TILE, 1],
+                                            )
+                                            xq_bf16 = pl.create_tile(
+                                                [AIV_ROW_TILE, XQ_TILE],
+                                                dtype=pl.BF16,
+                                                target_memory=pl.Mem.Vec,
                                             )
                                             for r in pl.range(AIV_ROW_TILE):
-                                                # Reads may spill past TOTAL
-                                                # into the zero-filled slack
-                                                # (token 0 rows; only
-                                                # valid_rows are consumed later).
-                                                ar = pl.read(
-                                                    assign_rows,
-                                                    [lbase + src0 + rb + r, 0],
-                                                )
-                                                tok = pl.cast(ar // TOPK, pl.INDEX)
-                                                xq_bf16 = pl.tile.assemble(
-                                                    xq_bf16,
-                                                    pl.load(
-                                                        x_normed, [tok, k0], [1, XQ_TILE],
+                                                tok_r = pl.cast(
+                                                    pl.tile.read(
+                                                        tok_tile, [r, 0],
                                                     ),
+                                                    pl.INDEX,
+                                                )
+                                                xq_bf16 = pl.gather_row(
+                                                    xq_bf16,
+                                                    x_normed,
                                                     [r, 0],
+                                                    [tok_r, k0],
+                                                    [1, XQ_TILE],
                                                 )
                                             # The ceil-scale bit trick needs
                                             # FP32 values.
