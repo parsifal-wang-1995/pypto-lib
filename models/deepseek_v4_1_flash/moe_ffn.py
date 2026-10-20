@@ -85,7 +85,7 @@ TOTAL = T * TOPK
 # window-relative (0 .. CHUNK_ROWS), which keeps every MX_A_ZZ scale view
 # provably 16-aligned without a dynamic per-expert base.
 #
-# RECV_TILE=64: one xgather/GMM1/act/GMM2/scatter instance serves the whole
+# RECV_TILE=64: one xgather/GMM1/act/GMM2 instance serves the whole
 # 64-row chunk. The GMM instances are weight-load bound, so a 16-row tile
 # re-read the expert's full weights once per tile (3x at 36 rows/expert)
 # and tripled the AICPU submit count; one instance per chunk reads them
@@ -96,6 +96,13 @@ AIV_ROW_TILE = 16
 CHUNK_ROWS = 64
 CHUNK_TILES = (CHUNK_ROWS + RECV_TILE - 1) // RECV_TILE
 MAX_TILES_PER_EXPERT = (TOTAL + RECV_TILE - 1) // RECV_TILE
+# Expert-grouped GMM2 output staging (gather-reduce form): every expert's
+# rows land in one RECV_TILE-padded region of ``y_grouped`` so each whole-
+# tile fix-pipe store stays inside its own expert's rows; the reduce then
+# gathers each token's TOPK rows back through the route -> padded-row
+# inverse map. Worst case: TOTAL rows plus RECV_TILE-1 of padding per
+# non-empty expert (at most min(TOTAL, E) of them).
+Y_ROWS = TOTAL + (RECV_TILE - 1) * min(TOTAL, E)
 
 # tiling (mirrors expert_routed.py so the packed weight ABI is identical)
 MX_GROUP = 32
@@ -181,8 +188,10 @@ def moe_ffn_compute(
     with pl.scope():
         expert_count = pl.create_tensor([E, 1], dtype=pl.INT32)
         list_base = pl.create_tensor([E, 1], dtype=pl.INT32)
+        padded_base = pl.create_tensor([E, 1], dtype=pl.INT32)
         assign_rows = pl.create_tensor([TOTAL + RECV_TILE, 1], dtype=pl.INT32)
         w_compact = pl.create_tensor([TOTAL + RECV_TILE, 1], dtype=pl.FP32)
+        route_pos = pl.create_tensor([TOTAL, 1], dtype=pl.INT32)
         with pl.at(
             level=pl.Level.CORE_GROUP, name_hint="moe_ffn_group", deps=[input_ready],
         ) as group_tid:
@@ -200,10 +209,16 @@ def moe_ffn_compute(
                     eid = pl.tile.read(indices_tile, [t, k])
                     counts[eid] = counts[eid] + 1
             compact = pl.const(0, pl.INT32)
+            padded = pl.const(0, pl.INT32)
             for e in pl.range(E):
                 c = counts[e]
                 pl.write(list_base, [e, 0], compact)
+                pl.write(padded_base, [e, 0], padded)
                 compact = pl.cast(compact + c, pl.INT32)
+                padded = pl.cast(
+                    padded + ((c + RECV_TILE - 1) // RECV_TILE) * RECV_TILE,
+                    pl.INT32,
+                )
                 counts[e] = 0
             for t in pl.range(T):
                 for k in pl.range(TOPK):
@@ -211,6 +226,11 @@ def moe_ffn_compute(
                     pos = pl.read(list_base, [eid, 0]) + counts[eid]
                     pl.write(assign_rows, [pos, 0], pl.cast(t * TOPK + k, pl.INT32))
                     pl.write(w_compact, [pos, 0], pl.tile.read(weights_tile, [t, k]))
+                    pl.write(
+                        route_pos,
+                        [t * TOPK + k, 0],
+                        pl.read(padded_base, [eid, 0]) + counts[eid],
+                    )
                     counts[eid] = counts[eid] + 1
             for r in pl.range(RECV_TILE):
                 pl.write(w_compact, [TOTAL + r, 0], pl.const(0.0, pl.FP32))
@@ -218,14 +238,22 @@ def moe_ffn_compute(
             for e in pl.range(E):
                 pl.write(expert_count, [e, 0], counts[e])
 
-        y_buf = pl.create_tensor([TOTAL, D], dtype=pl.BF16)
+        # manual_dep: every expert's GMM2 writes only its own padded region,
+        # so the tasks need no ordering between each other. Auto OverlapMap
+        # tracking would chain the 12 per-expert GMM2 waves WAW-serial on this
+        # one shared tensor (measured: window 1374us, AIC occupancy 24%);
+        # correctness comes from the reduce's explicit expert-completion deps.
+        y_grouped = pl.create_tensor(
+            [Y_ROWS, D], dtype=pl.BF16, manual_dep=True,
+        )
         expert_completion_tids = pl.array.create(E, pl.TASK_ID)
 
         # ------------------------------------------------------------------
         # Stages 1-6, fused per expert: W1/W3/W2 in-kernel FP4->FP8 dequant
         # once per expert, then per 64-row chunk: gather + requant, GMM1
-        # (fix-pipe drains BF16), SwiGLU + requant, GMM2 (fix-pipe BF16),
-        # scatter into y_buf.
+        # (fix-pipe drains BF16), SwiGLU + requant, GMM2 (fix-pipe BF16)
+        # whose epilogue stores whole tiles contiguously straight into the
+        # expert's padded region of y_grouped — no row-transpose kernel.
         # ------------------------------------------------------------------
         for local_e in pl.parallel(E):
             tile_completion_tids = pl.array.create(MAX_TILES_PER_EXPERT, pl.TASK_ID)
@@ -237,6 +265,7 @@ def moe_ffn_compute(
             routed_w2_packed_e = routed_w2_packed[local_e, :, :]
             if n_rows > 0:
                 lbase = pl.cast(pl.read(list_base, [local_e, 0]), pl.INDEX)
+                pbase = pl.cast(pl.read(padded_base, [local_e, 0]), pl.INDEX)
                 with pl.scope():
                     w1_mxfp8 = pl.create_tensor([D, MOE_INTER], dtype=pl.FP8E4M3FN)
                     with pl.spmd(
@@ -709,8 +738,9 @@ def moe_ffn_compute(
                                                 )
                                             # Row-local quant: rows past
                                             # valid_rows carry finite slack
-                                            # values and are never scattered,
-                                            # so no validshape/fillpad dance.
+                                            # values and only ever land in the
+                                            # expert's y_grouped padding, so no
+                                            # validshape/fillpad dance.
                                             # The released activation quantizer
                                             # rounds the group scale upward.
                                             sq_input = h_fp32
@@ -788,7 +818,6 @@ def moe_ffn_compute(
 
                             for tt in pl.parallel(chunk_tiles):
                                 tt0 = tt * RECV_TILE
-                                valid_rows = pl.min(RECV_TILE, chunk_rows - tt0)
                                 src1 = chunk_row0 + tt0
                                 h_tile_mx = h_mx[tt0 : tt0 + RECV_TILE]
                                 h_tile_scale_backing = h_scale_backing[
@@ -801,10 +830,14 @@ def moe_ffn_compute(
                                 with pl.scope():
                                     # GMM2 drains through the fix-pipe straight
                                     # to BF16 (the golden rint): no FP32 GM
-                                    # round-trip, no separate round task.
-                                    recv_y_tile = pl.create_tensor(
-                                        [RECV_TILE, D], dtype=pl.BF16,
-                                    )
+                                    # round-trip, no separate round task. The
+                                    # drain targets the expert's padded region
+                                    # of y_grouped directly, so every
+                                    # [RECV_TILE, MX_W2_D_OUT_TILE] block lands
+                                    # as one vectorized contiguous store — the
+                                    # old per-row transpose kernel is gone, and
+                                    # rows past the expert's valid rows fall
+                                    # into its own padding, never read.
                                     with pl.spmd(
                                         D // MX_W2_TASK_TILE,
                                         name_hint="ffn_w2_mxfp4_aic",
@@ -852,49 +885,38 @@ def moe_ffn_compute(
                                                         y_acc, h_k, h_scale_k,
                                                         w2_tile, w2_scale_k,
                                                     )
-                                            recv_y_tile = pl.store(
-                                                y_acc, [0, d0], recv_y_tile,
+                                            y_grouped = pl.store(
+                                                y_acc, [pbase + src1, d0],
+                                                y_grouped,
                                             )
-
-                                    with pl.at(
-                                        level=pl.Level.CORE_GROUP,
-                                        name_hint="ffn_row_scatter",
-                                        deps=[w2_mxfp4_aic_tid],
-                                    ) as scatter_tid:
-                                        for r in pl.range(0, valid_rows):
-                                            j = pl.cast(
-                                                pl.read(
-                                                    assign_rows,
-                                                    [lbase + src1 + r, 0],
-                                                ),
-                                                pl.INDEX,
-                                            )
-                                            row = pl.load(recv_y_tile, [r, 0], [1, D])
-                                            y_buf = pl.store(row, [j, 0], y_buf)
                                     tile_completion_tids[
                                         chunk * CHUNK_TILES + tt
-                                    ] = scatter_tid
+                                    ] = w2_mxfp4_aic_tid
             expert_completion_tids[local_e] = pl.system.task_dummy(
                 deps=[tile_completion_tids],
             )
 
         # ------------------------------------------------------------------
         # Stage 8: top-k weighted aggregation, FP32 accumulate, one rint.
+        # Gather-read form: each block reads its token's TOPK rows straight
+        # out of the expert-grouped buffer through the route -> padded-row
+        # inverse map, with expert-granularity dependencies on the per-expert
+        # GMM2 completion events (no intermediate global-barrier dummy task).
         # ------------------------------------------------------------------
-        scatter_done = pl.system.task_dummy(
-            deps=[expert_completion_tids[e] for e in range(E)],
-        )
         with pl.spmd(
-            T * (D // RED_TILE), name_hint="moe_ffn_reduce", deps=[scatter_done],
+            T * (D // RED_TILE),
+            name_hint="moe_ffn_reduce",
+            deps=[expert_completion_tids[e] for e in range(E)],
         ):
             blk = pl.tile.get_block_idx()
             tok = blk // (D // RED_TILE)
             d0 = (blk % (D // RED_TILE)) * RED_TILE
             acc = pl.tile.full([1, RED_TILE], dtype=pl.FP32, value=0.0)
             for k in pl.range(TOPK):
+                row = pl.cast(pl.read(route_pos, [tok * TOPK + k, 0]), pl.INDEX)
                 acc = pl.add(
                     acc,
-                    pl.cast(pl.load(y_buf, [tok * TOPK + k, d0], [1, RED_TILE]), pl.FP32),
+                    pl.cast(pl.load(y_grouped, [row, d0], [1, RED_TILE]), pl.FP32),
                 )
             out = pl.store(
                 pl.cast(acc, target_type=pl.BF16, mode="rint"), [tok, d0], out,
